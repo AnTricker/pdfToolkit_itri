@@ -1,0 +1,36 @@
+project:
+  # Persistent JSON contract version.
+  schema_version: "0.2"
+  # Workspace root; relative paths are resolved from the repository root.
+  output_root: "output"
+  # Extract render DPI; also used when preprocess acquires pages from PDF.
+  render_dpi: 150
+  # Analyze subprocess heartbeat interval.
+  heartbeat_seconds: 30
+  # Reserved metadata; tool behavior is controlled by config/tools/* command.
+  ocr_language: "auto"
+  # Default tool-config loading list; analyze still requires CLI --tools.
+  tools: ["paddle", "mineru", "surya"]
+  # Reserved metadata; selected analyze tools currently run sequentially.
+  execution: "sequential"
+
+preprocessing:
+  custom_steps: []
+  binarization: "adaptive"
+  paddle_max_long_edge: 3000
+
+resolution:
+  low_dpi_warning: 150
+  target_dpi: 300
+
+conda:
+  core_env: "digital-pdf-core"
+  paddle_env: "digital-pdf-paddle"
+  mineru_env: "digital-pdf-mineru"
+  surya_env: "digital-pdf-surya"
+
+logging:
+  # Reserved display preference; EventLogger currently emits directly.
+  terminal_level: "INFO"
+  # Keys whose values are masked from terminal and event logs.
+  redact_keys: ["token", "secret", "password", "api_key", "authorization"]

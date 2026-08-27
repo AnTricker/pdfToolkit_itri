@@ -1,0 +1,16 @@
+tool:
+  # CLI/config selector used by --tools surya.
+  name: "surya"
+  # Declared version recorded in attempt metadata.
+  version: "surya-ocr>=0.20,<1"
+  # Conda environment used by analyze.
+  environment: "digital-pdf-surya"
+  # Actual command template. Placeholders: {analysis_pages_dir}, {raw_dir}.
+  command:
+    - "surya_ocr"
+    - "{analysis_pages_dir}"
+    - "--output_dir"
+    - "{raw_dir}"
+  options:
+    # Descriptive metadata only; add real Surya flags to command.
+    language_profile: "auto"

@@ -1,0 +1,6 @@
+# Reserved metadata. Current `analyze create` loads full.yml directly;
+# configure analyze with config/tools/*.yml or CLI --config.
+profile:
+  name: "analyze-only"
+  # Informational only; the explicit CLI does not execute this list.
+  stages: ["analyze", "assets"]

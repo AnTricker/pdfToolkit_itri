@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "digital-pdf-toolkit"
+version = "0.1.0"
+description = "Traceable Digital PDF extraction and tool bake-off orchestration"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "PyMuPDF>=1.26,<2",
+  "pdfplumber>=0.11,<1",
+  "Pillow>=10,<13",
+  "pillow-heif>=1,<2",
+  "PyYAML>=6,<7",
+  "opencv-python-headless>=4.10,<5",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[project.scripts]
+digital-pdf-toolkit = "digital_pdf_toolkit.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,4 @@
+profile:
+  name: "full"
+  stages: ["extract", "analyze", "assets"]
+
