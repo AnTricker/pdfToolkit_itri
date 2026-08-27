@@ -29,28 +29,12 @@ def load_yaml(path: Path, required: bool = True) -> dict[str, Any]:
     return value
 
 
-def load_config(
-    root: Path,
-    profile: str = "full",
-    tools: list[str] | None = None,
-    custom_path: Path | None = None,
-    cli_overrides: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Resolve default -> local -> tools -> profile -> custom -> CLI."""
+def load_config(root: Path, custom_path: Path | None = None) -> dict[str, Any]:
+    """Resolve the two supported defaults, optional local settings, and one override."""
     config_dir = root / "config"
     result = load_yaml(config_dir / "default.yml")
+    result = deep_merge(result, load_yaml(config_dir / "surya2.yml"))
     result = deep_merge(result, load_yaml(config_dir / "local.yml", required=False))
-    selected_tools = tools or list(result["project"]["tools"])
-    tool_values: dict[str, Any] = {}
-    for tool in selected_tools:
-        tool_config = load_yaml(config_dir / "tools" / f"{tool}.yml")
-        tool_values[tool] = tool_config["tool"]
-    result["tools"] = tool_values
-    result = deep_merge(result, load_yaml(config_dir / "profiles" / f"{profile}.yml"))
     if custom_path:
         result = deep_merge(result, load_yaml(custom_path))
-    if cli_overrides:
-        result = deep_merge(result, cli_overrides)
-    result["resolved_tools"] = selected_tools
     return result
-

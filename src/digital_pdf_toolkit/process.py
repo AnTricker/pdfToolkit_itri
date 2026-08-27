@@ -4,10 +4,23 @@ import queue
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
 from .events import EventLogger
+from .metadata import MetadataSampler
+
+
+@dataclass
+class ProcessResult:
+    exit_code: int
+    duration_seconds: float
+    started_at: str
+    finished_at: str
+    samples: list[dict]
+    warnings: list[str]
 
 
 def _pump(stream: TextIO, destination: TextIO, label: str, messages: queue.Queue[tuple[str, str | None]]) -> None:
@@ -26,12 +39,12 @@ def run_process(
     stdout_path: Path,
     stderr_path: Path,
     logger: EventLogger,
-    tool: str,
-    attempt: str,
     heartbeat_seconds: int,
-) -> tuple[int, float]:
+    sampling_interval: float,
+) -> ProcessResult:
     started = time.monotonic()
-    logger.emit("analyze", "START", "process started", tool=tool, attempt=attempt)
+    started_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    logger.emit("surya2", "START", "process started")
     messages: queue.Queue[tuple[str, str | None]] = queue.Queue()
     with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open(
         "w", encoding="utf-8"
@@ -46,6 +59,9 @@ def run_process(
             errors="replace",
             bufsize=1,
         )
+        sampler = MetadataSampler(process.pid)
+        samples: list[dict] = []
+        next_sample = started
         assert process.stdout is not None and process.stderr is not None
         threads = [
             threading.Thread(target=_pump, args=(process.stdout, stdout_file, "stdout", messages), daemon=True),
@@ -61,15 +77,28 @@ def run_process(
                 if line is None:
                     completed_streams += 1
                 elif line and ("page" in line.lower() or "progress" in line.lower()):
-                    logger.emit("analyze", "RUN", line, tool=tool, attempt=attempt)
+                    logger.emit("surya2", "RUN", line)
             except queue.Empty:
                 pass
+            now = time.monotonic()
+            if process.poll() is None and now >= next_sample:
+                try:
+                    samples.append(sampler.sample())
+                except Exception as exc:  # metadata is best-effort
+                    sampler.amd.warning = f"metadata sampling failed: {exc}"
+                next_sample = now + sampling_interval
             if time.monotonic() - last_heartbeat >= heartbeat_seconds and process.poll() is None:
                 elapsed = round(time.monotonic() - started)
-                logger.emit("analyze", "RUN", f"elapsed={elapsed}s, process active", tool=tool, attempt=attempt)
+                logger.emit("surya2", "RUN", f"elapsed={elapsed}s, process active")
                 last_heartbeat = time.monotonic()
         for thread in threads:
             thread.join(timeout=1)
         exit_code = process.wait()
-    return exit_code, time.monotonic() - started
-
+    return ProcessResult(
+        exit_code=exit_code,
+        duration_seconds=time.monotonic() - started,
+        started_at=started_at,
+        finished_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        samples=samples,
+        warnings=sampler.warnings,
+    )

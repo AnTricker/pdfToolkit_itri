@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
-from .image_ops import natural_key
+from .sorting import natural_key
 
 
 def convert_folder(input_dir: Path, output_dir: Path | None = None) -> list[Path]:

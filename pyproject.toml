@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "digital-pdf-toolkit"
 version = "0.1.0"
-description = "Traceable Digital PDF extraction and tool bake-off orchestration"
+description = "Native PDF extraction and batched Surya OCR orchestration"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
@@ -14,7 +14,6 @@ dependencies = [
   "Pillow>=10,<13",
   "pillow-heif>=1,<2",
   "PyYAML>=6,<7",
-  "opencv-python-headless>=4.10,<5",
 ]
 
 [project.optional-dependencies]

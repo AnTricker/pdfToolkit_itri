@@ -5,7 +5,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw
 
-from .adapters import create_reader
+from .adapters.surya import SuryaRunReader
 from .events import EventLogger
 from .io import relative_to, write_json
 
@@ -16,40 +16,39 @@ COLORS = {
 }
 
 
-def build_assets(
-    tool: str,
-    attempt: dict[str, Any],
-    document_root: Path,
-    page_set: dict[str, Any],
+def build_surya_assets(
+    result_root: Path,
+    images: list[dict[str, Any]],
     logger: EventLogger,
-) -> dict[str, Any] | None:
-    if attempt.get("state") != "completed":
-        return None
-    attempt_root = document_root / attempt["path"]
-    assets_root = attempt_root / "assets"
+) -> dict[str, Any]:
+    """Build crops and overlays using strict source-filename to global-page mapping."""
+    assets_root = result_root / "assets"
     crops_root = assets_root / "crops"
     overlays_root = assets_root / "overlays"
     crops_root.mkdir(parents=True, exist_ok=True)
     overlays_root.mkdir(parents=True, exist_ok=True)
-    logger.emit("assets", "START", "building page-set crops and overlays", tool=tool, attempt=attempt["id"])
-    page_map = {int(page["page_index"]): page for page in page_set["pages"]}
-    dimensions = {index: (float(page["width_px"]), float(page["height_px"])) for index, page in page_map.items()}
-    try:
-        reader = create_reader(tool, attempt_root / "raw")
-        page_mapping = {
-            Path(page["path"]).stem: int(page["page_index"])
-            for page in page_set["pages"]
-        }
-        if hasattr(reader, "with_page_mapping"):
-            reader = reader.with_page_mapping(page_mapping)  # type: ignore[attr-defined]
-        if hasattr(reader, "with_page_dimensions"):
-            reader = reader.with_page_dimensions(dimensions)  # type: ignore[attr-defined]
-        index: dict[str, Any] = {
-            "tool": tool, "attempt": attempt["id"], "input_page_set": page_set["page_set_id"],
-            "regions": {}, "overlays": {}, "warnings": [],
-        }
-        for page_index, page in page_map.items():
-            source = Image.open(document_root / page["path"]).convert("RGB")
+    logger.emit("assets", "START", "building Surya crops and overlays")
+    page_map = {int(page["page_index"]): page for page in images}
+    stems: dict[str, int] = {}
+    for page_index, page in page_map.items():
+        stem = Path(page["path"]).stem.casefold()
+        if stem in stems:
+            raise ValueError(f"Duplicate source image stem: {stem}")
+        stems[stem] = page_index
+    reader = SuryaRunReader(result_root / "results.json").with_page_mapping(stems)
+    expected = set(page_map)
+    if reader.page_indices() != expected:
+        missing = sorted(expected - reader.page_indices())
+        unexpected = sorted(reader.page_indices() - expected)
+        raise ValueError(f"Surya filename mapping mismatch; missing={missing}, unexpected={unexpected}")
+    index: dict[str, Any] = {
+        "tool": "surya", "mode": "surya2", "pages": {},
+        "regions": {}, "overlays": {}, "warnings": [],
+    }
+    for page_index, page in page_map.items():
+        source_path = Path(page["path"])
+        with Image.open(source_path) as opened:
+            source = opened.convert("RGB")
             overlay = source.copy()
             draw = ImageDraw.Draw(overlay)
             for region in reader.regions(page_index):
@@ -64,21 +63,23 @@ def build_assets(
                     draw.text((pixels[0] + 2, pixels[1] + 2), region.type, fill=color)
                     index["regions"][region.id] = {
                         "page_index": page_index, "type": region.type,
+                        "source_image": str(source_path.resolve()),
                         "tool_bbox": list(region.coordinates.bbox),
                         "coordinate_space": region.coordinates.space,
                         "render_bbox": list(pixels),
-                        "exact_crop": relative_to(crop_path, document_root),
+                        "exact_crop": relative_to(crop_path, result_root),
                         "text": region.text, "provenance": region.provenance,
                     }
                 except Exception as exc:
                     index["warnings"].append({"region_id": region.id, "detail": str(exc)})
-            overlay_path = overlays_root / Path(page["path"]).name
+            overlay_path = overlays_root / source_path.name
             overlay.save(overlay_path)
-            index["overlays"][str(page_index)] = relative_to(overlay_path, document_root)
-        write_json(assets_root / "index.json", index)
-        logger.emit("assets", "DONE", f"regions={len(index['regions'])}", tool=tool, attempt=attempt["id"])
-        return index
-    except Exception as exc:
-        logger.emit("assets", "FAILED", str(exc), tool=tool, attempt=attempt["id"], level="ERROR")
-        attempt["assets_error"] = str(exc)
-        return None
+            index["pages"][str(page_index)] = {
+                "source_image": str(source_path.resolve()),
+                "batch": page.get("batch"),
+                "batch_position": page.get("batch_position"),
+            }
+            index["overlays"][str(page_index)] = relative_to(overlay_path, result_root)
+    write_json(assets_root / "index.json", index)
+    logger.emit("assets", "DONE", f"regions={len(index['regions'])}")
+    return index

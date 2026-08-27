@@ -29,8 +29,6 @@ class EventLogger:
         message: str,
         *,
         level: str = "INFO",
-        tool: str | None = None,
-        attempt: str | None = None,
         data: dict[str, Any] | None = None,
     ) -> None:
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -40,16 +38,12 @@ class EventLogger:
             "level": level,
             "stage": stage,
             "state": state,
-            "tool": tool,
-            "attempt": attempt,
             "message": clean,
             "data": data or {},
         }
-        label = tool or stage
-        terminal = f"[{timestamp[11:19]}] [{label}] {state:<7} {clean}"
+        terminal = f"[{timestamp[11:19]}] [{stage}] {state:<7} {clean}"
         print(terminal, file=sys.stderr if level == "ERROR" else sys.stdout, flush=True)
         with self.run_log.open("a", encoding="utf-8") as handle:
             handle.write(terminal + "\n")
         with self.events_log.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
-
