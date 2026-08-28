@@ -62,6 +62,28 @@ def test_existing_batches_are_strictly_validated(tmp_path: Path) -> None:
         runs.prepare_png_batches(tmp_path)
 
 
+def test_existing_batches_may_each_contain_fewer_than_ten_pngs(tmp_path: Path) -> None:
+    for batch_name in ("1", "2"):
+        batch = tmp_path / batch_name
+        batch.mkdir()
+        for index in range(5):
+            _png(batch / f"p{batch_name}-{index}.png")
+
+    batches = runs.prepare_png_batches(tmp_path)
+
+    assert [len(images) for _, images in batches] == [5, 5]
+
+
+def test_existing_batch_cannot_exceed_ten_pngs(tmp_path: Path) -> None:
+    batch = tmp_path / "1"
+    batch.mkdir()
+    for index in range(11):
+        _png(batch / f"p{index}.png")
+
+    with pytest.raises(ValueError, match="1-10"):
+        runs.prepare_png_batches(tmp_path)
+
+
 def test_mixed_top_level_and_numeric_batches_are_rejected(tmp_path: Path) -> None:
     _png(tmp_path / "page.png")
     (tmp_path / "1").mkdir()

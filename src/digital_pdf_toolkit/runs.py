@@ -124,12 +124,10 @@ def prepare_png_batches(input_dir: Path) -> list[tuple[str | None, list[dict[str
         if [path.name for path in numeric] != expected_names:
             raise ValueError(f"Batch folders must be consecutively named: {expected_names}")
         values: list[tuple[str | None, list[Path]]] = []
-        for index, directory in enumerate(numeric):
+        for directory in numeric:
             paths = _pngs(directory)
-            required = range(1, BATCH_SIZE + 1) if index == len(numeric) - 1 else range(BATCH_SIZE, BATCH_SIZE + 1)
-            if len(paths) not in required:
-                expectation = "1-10" if index == len(numeric) - 1 else "10"
-                raise ValueError(f"Batch {directory.name} must contain {expectation} PNG files")
+            if not 1 <= len(paths) <= BATCH_SIZE:
+                raise ValueError(f"Batch {directory.name} must contain 1-10 PNG files")
             values.append((directory.name, paths))
         return _records(values)
     if not top_level:

@@ -20,7 +20,7 @@
 - PNG folder：
   - ≤10 張：結果直接寫入 run root。
   - >10 張：依 case-insensitive natural sort，直接移動至原 input 的 `1/、2/…`；每批 10 張，最後一批 1–10 張。
-  - 再次執行既有 batches 時全部重跑；要求編號連續、非末批恰為 10 張。root 同時有 PNG 與數字 subfolders 時報錯。
+  - 再次執行既有 batches 時全部重跑；要求編號連續，每批允許 1–10 張。root 同時有 PNG 與數字 subfolders 時報錯。
 - Batches 嚴格循序執行。單批失敗後繼續，其 `status.json` 記錄失敗；任一批失敗時整體 exit code 非 0，最後只額外顯示 completed／failed batch 統計。
 - 建立 filename-based mapping，記錄原始 filename、global page index、batch 與 batch-local position。Crop、overlay、assets index 使用 global page index；缺頁、重複 stem 或不唯一 mapping 使該 batch 失敗。
 - 將 metadata logger 移入 package，整合為 `surya2` 自動流程：

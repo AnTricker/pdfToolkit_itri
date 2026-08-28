@@ -90,7 +90,7 @@ run.log
 events.jsonl
 ```
 
-既有 batch folder 必須從 `1/` 連續編號；除最後一批外恰為 10 張。重新執行會全部重跑並建立新的 timestamp output。
+既有 batch folder 必須從 `1/` 連續編號；每個 folder 可包含 1–10 張。重新執行會全部重跑並建立新的 timestamp output。自動分批仍以每批 10 張切分，最後一批可不足 10 張。
 
 ## Output naming
 
