@@ -20,16 +20,24 @@ def build_parser() -> argparse.ArgumentParser:
     surya2 = modes.add_parser("surya2", help="Run Surya against a PNG folder or one PDF")
     surya2.add_argument("input", type=Path)
     surya2.add_argument("--config", type=Path)
+
+    marker = modes.add_parser("marker", help="Run Marker against one PDF")
+    marker.add_argument("input", type=Path)
+    marker.add_argument("--config", type=Path)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    from .runs import run_extract, run_surya2
+    from .runs import run_extract, run_marker, run_surya2
 
     try:
         if args.command == "extract":
             output = run_extract(toolkit_root(), args.input, args.config)
+            print(f"Output: {output}")
+            return 0
+        if args.command == "marker":
+            output = run_marker(toolkit_root(), args.input, args.config)
             print(f"Output: {output}")
             return 0
         output, failed_batches = run_surya2(toolkit_root(), args.input, args.config)

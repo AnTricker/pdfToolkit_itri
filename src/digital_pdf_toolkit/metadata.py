@@ -260,21 +260,26 @@ def write_metadata(
     samples: list[dict[str, Any]],
     warnings: list[str],
     interval: float,
+    mode: str = "surya2",
+    workload_unit: str = "png",
 ) -> None:
     metadata_root = result_root / "metadata"
     metadata_root.mkdir(parents=True, exist_ok=True)
+    count_key = "png_count" if workload_unit == "png" else f"{workload_unit}_count"
+    singular = "image" if workload_unit == "png" else workload_unit
+    plural = "images" if workload_unit == "png" else f"{workload_unit}s"
     summary = {
         "schema_version": 1,
         "run": {
-            "mode": "surya2", "command": _redact(command), "hostname": platform.node(),
+            "mode": mode, "command": _redact(command), "hostname": platform.node(),
             "platform": platform.platform(), "python": platform.python_version(),
             "started_at_utc": started_at, "finished_at_utc": finished_at, "exit_code": exit_code,
         },
         "sampling": {"interval_seconds": interval, "sample_count": len(samples), "gpu_source": "amd-smi (GPU 0)"},
         "workload": {
-            "png_count": image_count, "total_seconds": duration,
-            "seconds_per_image": duration / image_count if image_count else None,
-            "images_per_second": image_count / duration if image_count and duration else None,
+            count_key: image_count, "total_seconds": duration,
+            f"seconds_per_{singular}": duration / image_count if image_count else None,
+            f"{plural}_per_second": image_count / duration if image_count and duration else None,
         },
         "metrics": {field: _metric(samples, field) for field in SAMPLE_FIELDS[2:]},
         "warnings": list(dict.fromkeys(warnings)),

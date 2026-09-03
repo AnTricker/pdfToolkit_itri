@@ -34,6 +34,7 @@ def load_config(root: Path, custom_path: Path | None = None) -> dict[str, Any]:
     config_dir = root / "config"
     result = load_yaml(config_dir / "default.yml")
     result = deep_merge(result, load_yaml(config_dir / "surya2.yml"))
+    result = deep_merge(result, load_yaml(config_dir / "marker.yml"))
     result = deep_merge(result, load_yaml(config_dir / "local.yml", required=False))
     if custom_path:
         result = deep_merge(result, load_yaml(custom_path))

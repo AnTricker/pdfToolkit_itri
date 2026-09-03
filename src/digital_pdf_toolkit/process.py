@@ -41,10 +41,11 @@ def run_process(
     logger: EventLogger,
     heartbeat_seconds: int,
     sampling_interval: float,
+    mode: str = "surya2",
 ) -> ProcessResult:
     started = time.monotonic()
     started_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-    logger.emit("surya2", "START", "process started")
+    logger.emit(mode, "START", "process started")
     messages: queue.Queue[tuple[str, str | None]] = queue.Queue()
     with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open(
         "w", encoding="utf-8"
@@ -77,7 +78,7 @@ def run_process(
                 if line is None:
                     completed_streams += 1
                 elif line and ("page" in line.lower() or "progress" in line.lower()):
-                    logger.emit("surya2", "RUN", line)
+                    logger.emit(mode, "RUN", line)
             except queue.Empty:
                 pass
             now = time.monotonic()
@@ -89,7 +90,7 @@ def run_process(
                 next_sample = now + sampling_interval
             if time.monotonic() - last_heartbeat >= heartbeat_seconds and process.poll() is None:
                 elapsed = round(time.monotonic() - started)
-                logger.emit("surya2", "RUN", f"elapsed={elapsed}s, process active")
+                logger.emit(mode, "RUN", f"elapsed={elapsed}s, process active")
                 last_heartbeat = time.monotonic()
         for thread in threads:
             thread.join(timeout=1)

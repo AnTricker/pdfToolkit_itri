@@ -24,6 +24,14 @@ def _config(output_root: Path) -> dict:
             "environment": "digital-pdf-surya", "version": "test",
             "command": ["surya_ocr", "{input_dir}", "--output_dir", "{output_dir}"],
         },
+        "marker": {
+            "environment": "digital-pdf-marker", "version": "test",
+            "mode": "balanced", "inference_backend": "llamacpp",
+            "command": [
+                "python", "{worker_script}", "{input_pdf}", "{output_dir}",
+                "--mode", "{mode}", "--inference-backend", "{inference_backend}",
+            ],
+        },
     }
 
 
@@ -211,3 +219,33 @@ def test_surya_batch_normalizes_results_and_writes_assets_metadata_and_status(
     assert (result_root / "metadata" / "summary.json").is_file()
     assert (result_root / "metadata" / "samples.csv").is_file()
     assert '"state": "completed"' in (result_root / "status.json").read_text(encoding="utf-8")
+
+
+def test_marker_orchestration_is_flat_and_writes_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pdf = tmp_path / "document.pdf"
+    pdf.write_bytes(b"placeholder")
+    config = _config(tmp_path / "output")
+    monkeypatch.setattr(runs, "load_config", lambda *_: config)
+    monkeypatch.setattr(runs, "_pdf_page_count", lambda _pdf: 2)
+
+    def fake_process(
+        _command: list[str], _cwd: Path, _stdout: Path, _stderr: Path,
+        _logger: object, _heartbeat: int, _interval: float, mode: str = "surya2",
+    ) -> ProcessResult:
+        assert mode == "marker"
+        run_root = Path(_command[_command.index("--mode") - 1])
+        for name in ("result.json", "result.md", "result_meta.json", "block_provenance.json"):
+            (run_root / name).write_text("{}", encoding="utf-8")
+        return ProcessResult(0, 0.25, "start", "finish", [], ["no hardware sampler"])
+
+    monkeypatch.setattr(runs, "run_process", fake_process)
+
+    output = runs.run_marker(tmp_path, pdf)
+
+    assert output.name.endswith("_marker")
+    assert (output / "result.json").is_file()
+    assert (output / "metadata" / "summary.json").is_file()
+    assert not (output / "attempt").exists()
+    assert '"state": "completed"' in (output / "status.json").read_text(encoding="utf-8")

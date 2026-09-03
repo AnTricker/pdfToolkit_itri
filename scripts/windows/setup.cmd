@@ -6,7 +6,7 @@ if errorlevel 1 (
   echo ERROR: conda is not available in PATH 1>&2
   exit /b 1
 )
-for %%C in (core surya) do (
+for %%C in (core surya marker) do (
   call :ensure_env %%C digital-pdf-%%C
   if errorlevel 1 exit /b 1
 )

@@ -211,6 +211,114 @@ def _validate_config(config: dict[str, Any]) -> None:
         raise ValueError("surya2.command must be a non-empty list")
 
 
+def _marker_command(config: dict[str, Any], input_pdf: Path, result_root: Path) -> tuple[list[str], list[str]]:
+    replacements = {
+        "worker_script": str((Path(__file__).parent / "marker_worker.py").resolve()),
+        "input_pdf": str(input_pdf.resolve()),
+        "output_dir": str(result_root.resolve()),
+        "mode": str(config["marker"]["mode"]),
+        "inference_backend": str(config["marker"]["inference_backend"]),
+    }
+    native = [str(part).format(**replacements) for part in config["marker"]["command"]]
+    command = [
+        "conda", "run", "--no-capture-output", "-n",
+        config["marker"]["environment"], *native,
+    ]
+    return command, native
+
+
+def _pdf_page_count(input_pdf: Path) -> int:
+    try:
+        import fitz
+    except ImportError as exc:  # pragma: no cover - real core environment
+        raise RuntimeError("PDF inspection requires PyMuPDF") from exc
+    document = fitz.open(input_pdf)
+    try:
+        if document.needs_pass:
+            raise PermissionError("PDF requires a password")
+        if document.page_count == 0:
+            raise ValueError("PDF contains no pages")
+        return document.page_count
+    finally:
+        document.close()
+
+
+def run_marker(toolkit_root: Path, input_pdf: Path, custom_config: Path | None = None) -> Path:
+    input_pdf = input_pdf.expanduser().resolve()
+    if not input_pdf.is_file() or input_pdf.suffix.lower() != ".pdf":
+        raise ValueError(f"marker requires one PDF file: {input_pdf}")
+    config = load_config(toolkit_root, custom_config)
+    marker_command = config["marker"].get("command")
+    if not isinstance(marker_command, list) or not marker_command:
+        raise ValueError("marker.command must be a non-empty list")
+    if float(config["metadata"]["sampling_interval_seconds"]) <= 0:
+        raise ValueError("metadata.sampling_interval_seconds must be greater than zero")
+    if int(config["project"]["heartbeat_seconds"]) <= 0:
+        raise ValueError("project.heartbeat_seconds must be greater than zero")
+
+    page_count = _pdf_page_count(input_pdf)
+    run_root = allocate_run_root(toolkit_root, config, "marker")
+    logger = EventLogger(run_root, config["logging"].get("redact_keys"))
+    command, native = _marker_command(config, input_pdf, run_root)
+    write_json(run_root / "command.json", {"command": command, "native_command": native, "marker": config["marker"]})
+    environment = _environment_payload(config)
+    environment.update({
+        "marker_environment": config["marker"]["environment"],
+        "declared_marker_version": config["marker"].get("version"),
+    })
+    write_json(run_root / "environment.json", environment)
+    status: dict[str, Any] = {
+        "mode": "marker", "state": "running", "input": str(input_pdf),
+        "page_count": page_count, "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json(run_root / "status.json", status)
+    interval = float(config["metadata"]["sampling_interval_seconds"])
+    started_at = utc_now()
+    started = time.monotonic()
+    process_result: ProcessResult | None = None
+    warnings: list[str] = []
+    try:
+        process_result = run_process(
+            command, toolkit_root, run_root / "stdout.log", run_root / "stderr.log",
+            logger, int(config["project"]["heartbeat_seconds"]), interval, mode="marker",
+        )
+        if process_result.exit_code != 0:
+            raise RuntimeError(f"Marker exited with code {process_result.exit_code}")
+        required = ("result.json", "result.md", "result_meta.json", "block_provenance.json")
+        missing = [name for name in required if not (run_root / name).is_file()]
+        if missing:
+            raise RuntimeError(f"Marker did not produce required output: {', '.join(missing)}")
+        status.update({
+            "state": "completed", "exit_code": process_result.exit_code,
+            "duration_seconds": round(process_result.duration_seconds, 3),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.emit("marker", "DONE", f"pages={page_count}")
+        return run_root
+    except Exception as exc:
+        status.update({
+            "state": "failed", "exit_code": process_result.exit_code if process_result else None,
+            "error": str(exc), "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.emit("marker", "FAILED", str(exc), level="ERROR")
+        raise
+    finally:
+        duration = process_result.duration_seconds if process_result else time.monotonic() - started
+        samples = process_result.samples if process_result else []
+        warnings.extend(process_result.warnings if process_result else ["Marker process did not start; hardware samples are unavailable"])
+        try:
+            write_metadata(
+                run_root, command=command, image_count=page_count,
+                started_at=process_result.started_at if process_result else started_at,
+                finished_at=process_result.finished_at if process_result else utc_now(), duration=duration,
+                exit_code=process_result.exit_code if process_result else None, samples=samples,
+                warnings=warnings, interval=interval, mode="marker", workload_unit="page",
+            )
+        except Exception as exc:
+            logger.emit("metadata", "WARNING", str(exc))
+        write_json(run_root / "status.json", status)
+
+
 def run_surya_batch(
     toolkit_root: Path,
     result_root: Path,

@@ -1,7 +1,8 @@
 # Digital PDF Toolkit
 
-本專案提供三個獨立 command：HEIC 轉 PNG、Digital PDF native extraction，以及具備自動分批與效能紀錄的 Surya OCR。
+本專案提供 HEIC 轉 PNG、PNG 合併 PDF、Digital PDF native extraction、Surya OCR 與 Marker 文件分析。
 
+---
 ## Setup
 
 ```bash
@@ -12,7 +13,7 @@
 scripts\windows\setup.cmd
 ```
 
-只建立／更新 `digital-pdf-core` 與 `digital-pdf-surya`。
+建立／更新 `digital-pdf-core`、`digital-pdf-surya` 與 `digital-pdf-marker`。
 
 ## Commands
 
@@ -25,6 +26,17 @@ scripts\windows\setup.cmd
 
 預設輸出至 `<input>/scan_source_pages/`。只處理 input root 的 `.heic/.heif`，依 natural filename order 產生 `p0001.png...`。
 
+---
+### PNG to PDF
+
+```bash
+./scripts/linux/png-to-pdf.sh png-folder
+./scripts/linux/png-to-pdf.sh png-folder --output document.pdf
+```
+
+只處理 input root 的 `.png`，依 natural filename order 合併為單一 PDF。預設輸出為 `<input>/<folder-name>.pdf`，不覆寫既有檔案。
+
+---
 ### Extract
 
 ```bash
@@ -47,6 +59,7 @@ output/MMDDHHmm_extract/
 └─ events.jsonl
 ```
 
+---
 ### Surya2
 
 ```bash
@@ -92,6 +105,35 @@ events.jsonl
 
 既有 batch folder 必須從 `1/` 連續編號；每個 folder 可包含 1–10 張。重新執行會全部重跑並建立新的 timestamp output。自動分批仍以每批 10 張切分，最後一批可不足 10 張。
 
+---
+### Marker
+
+```bash
+./scripts/linux/marker.sh document.pdf
+./scripts/linux/marker.sh document.pdf --config config/custom.yml
+```
+
+Marker 僅接受單一 PDF，分析一次後輸出官方 JSON、Markdown 與原生擷取圖片。`block_provenance.json` 額外保存每個 block 的 Marker `text_extraction_method`，並將 `surya` 標示為 `ocr`：
+
+```text
+output/MMDDHHmm_marker/
+├─ result.json
+├─ result.md
+├─ result_meta.json
+├─ block_provenance.json
+├─ <Marker 原生圖片>
+├─ metadata/
+├─ command.json
+├─ environment.json
+├─ status.json
+├─ stdout.log
+├─ stderr.log
+├─ run.log
+└─ events.jsonl
+```
+
+Marker 預設固定使用 `balanced` mode，並透過 `llama.cpp` 的 `llama-server` 執行 Surya VLM；不啟用額外 LLM、強制 OCR、額外 crop 或 embedding normalization。
+
 ## Output naming
 
 Run folder 使用本機時間 `MMDDHHmm_<mode>`。同分鐘、同 mode 的後續 run 依序使用 `_02`、`_03`。
@@ -100,6 +142,7 @@ Run folder 使用本機時間 `MMDDHHmm_<mode>`。同分鐘、同 mode 的後續
 
 - `config/default.yml`：output root、render DPI、heartbeat、metadata sampling 與 logging。
 - `config/surya2.yml`：Surya environment、version 與實際 native command。
+- `config/marker.yml`：Marker environment、version 與 worker command。
 - `--config` 指定的 YAML 最後套用，可覆蓋以上設定。
 
 Batch size 固定為 10，不開放調整。

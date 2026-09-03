@@ -12,8 +12,12 @@ def test_deep_merge_does_not_drop_siblings() -> None:
     }
 
 
-def test_default_and_surya2_config_are_loaded() -> None:
+def test_default_surya2_and_marker_config_are_loaded() -> None:
     config = load_config(ROOT)
     assert config["project"]["render_dpi"] == 150
     assert config["surya2"]["environment"] == "digital-pdf-surya"
     assert config["surya2"]["command"][0] == "surya_ocr"
+    assert config["marker"]["environment"] == "digital-pdf-marker"
+    assert config["marker"]["mode"] == "balanced"
+    assert config["marker"]["inference_backend"] == "llamacpp"
+    assert config["marker"]["command"][0] == "python"

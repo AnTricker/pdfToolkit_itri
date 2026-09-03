@@ -8,7 +8,7 @@ if ! command -v conda >/dev/null 2>&1; then
   exit 1
 fi
 
-for component in core surya; do
+for component in core surya marker; do
   env_file="${TOOLKIT_ROOT}/environments/${component}/environment.yml"
   env_name="$(awk '/^name:/ {print $2; exit}' "${env_file}")"
   if conda env list | awk '{print $1}' | grep -Fxq "${env_name}"; then
