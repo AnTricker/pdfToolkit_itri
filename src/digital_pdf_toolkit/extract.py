@@ -34,10 +34,9 @@ def extract_document(pdf_path: Path, run_root: Path, render_dpi: int, logger: Ev
     except ImportError as exc:  # pragma: no cover - exercised in the real core env
         raise RuntimeError("Core environment requires PyMuPDF and pdfplumber") from exc
 
-    observed_root = run_root / "observed"
-    pages_root = observed_root / "pages"
-    renders_root = observed_root / "page_renders"
-    embedded_root = observed_root / "embedded_images"
+    pages_root = run_root / "pages"
+    renders_root = run_root / "page_renders"
+    embedded_root = run_root / "embedded_images"
     for directory in (pages_root, renders_root, embedded_root):
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -216,6 +215,6 @@ def extract_document(pdf_path: Path, run_root: Path, render_dpi: int, logger: Ev
             logger.emit("extract", "RUN", f"page={page_index + 1}/{document.page_count}")
 
     document.close()
-    write_json(observed_root / "document.json", summary)
+    write_json(run_root / "document.json", summary)
     logger.emit("extract", "DONE", f"pages={summary['page_count']}")
     return summary

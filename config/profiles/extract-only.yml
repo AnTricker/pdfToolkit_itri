@@ -1,6 +1,0 @@
-# Reserved metadata. Current `extract create` loads full.yml directly;
-# configure extract with default.yml, local.yml, or CLI --config.
-profile:
-  name: "extract-only"
-  # Informational only; the explicit CLI does not execute this list.
-  stages: ["extract"]

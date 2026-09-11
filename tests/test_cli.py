@@ -1,30 +1,21 @@
+import pytest
+
 from digital_pdf_toolkit.cli import build_parser
 
 
-def test_cli_exposes_explicit_modes_and_bindings() -> None:
+def test_cli_exposes_extract_surya2_and_marker() -> None:
     parser = build_parser()
-    preprocess = parser.parse_args([
-        "preprocess", "retry", "doc-0819-1430", "--from", "attempt-001_0819-1432",
-        "--overrides", "overrides.json",
-    ])
-    assert preprocess.parent_attempt == "attempt-001_0819-1432"
-    analyze = parser.parse_args([
-        "analyze", "create", "doc-0819-1430", "--page-set",
-        "preprocess:attempt-002_0819-1505", "--tools", "paddle,surya",
-    ])
-    assert analyze.page_set == "preprocess:attempt-002_0819-1505"
-    finalize = parser.parse_args([
-        "finalize", "create", "doc-0819-1430", "--tool", "paddle",
-        "--attempt", "attempt-001_0819-1520",
-    ])
-    assert finalize.attempt == "attempt-001_0819-1520"
+    extract = parser.parse_args(["extract", "document.pdf", "--config", "custom.yml"])
+    assert extract.command == "extract"
+    assert extract.input.name == "document.pdf"
+    surya2 = parser.parse_args(["surya2", "images"])
+    assert surya2.command == "surya2"
+    marker = parser.parse_args(["marker", "document.pdf"])
+    assert marker.command == "marker"
 
 
-def test_aggregate_run_command_is_removed() -> None:
+@pytest.mark.parametrize("legacy", ["pages", "preprocess", "resolution", "analyze", "finalize"])
+def test_legacy_commands_are_removed(legacy: str) -> None:
     parser = build_parser()
-    try:
-        parser.parse_args(["run", "sample.pdf"])
-    except SystemExit as exc:
-        assert exc.code != 0
-    else:  # pragma: no cover
-        raise AssertionError("legacy run command should not parse")
+    with pytest.raises(SystemExit):
+        parser.parse_args([legacy])

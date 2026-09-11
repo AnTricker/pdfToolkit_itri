@@ -8,15 +8,21 @@ from typing import Any, Iterable
 from digital_pdf_toolkit.coordinates import RegionCoordinates, normalize_bbox
 
 from .base import AnalysisRegion, AnalysisRunReader
-from .helpers import box_from, load_first
+from .helpers import box_from
+from digital_pdf_toolkit.io import read_json
 
 
 class SuryaRunReader(AnalysisRunReader):
     tool_name = "surya"
 
-    def __init__(self, result_root: Path):
-        super().__init__(result_root)
-        self.path, self.document = load_first(result_root, ["results.json"])
+    def __init__(self, results_path: Path):
+        super().__init__(results_path.parent)
+        if results_path.name != "results.json" or not results_path.is_file():
+            raise FileNotFoundError(f"Expected normalized Surya result: {results_path}")
+        self.path = results_path
+        self.document = read_json(results_path)
+        self._entries = list(self._page_values())
+        self._entry_indices = {index: inferred for index, (_, inferred, _) in enumerate(self._entries)}
         self._regions = list(self._parse())
 
     def _page_values(self) -> Iterable[tuple[str, int, dict[str, Any]]]:
@@ -40,8 +46,8 @@ class SuryaRunReader(AnalysisRunReader):
 
     def _parse(self) -> Iterable[AnalysisRegion]:
         sequence = 0
-        for raw_page_key, inferred_page, page in self._page_values():
-            page_index = inferred_page
+        for entry_index, (raw_page_key, inferred_page, page) in enumerate(self._entries):
+            page_index = self._entry_indices[entry_index]
             image_bbox = box_from(page.get("image_bbox")) or [0.0, 0.0, 1.0, 1.0]
             source_width = image_bbox[2] - image_bbox[0]
             source_height = image_bbox[3] - image_bbox[1]
@@ -65,21 +71,35 @@ class SuryaRunReader(AnalysisRunReader):
                         "tool": "surya",
                         "raw_file": str(self.path),
                         "raw_page_key": raw_page_key,
+                        "entry_index": entry_index,
                     },
                 )
 
     def with_page_mapping(self, mapping: dict[str, int]) -> "SuryaRunReader":
+        normalized = {str(key).casefold(): value for key, value in mapping.items()}
+        resolved: dict[int, int] = {}
+        seen: set[str] = set()
+        for entry_index, (raw_page_key, _, _) in enumerate(self._entries):
+            stem = Path(raw_page_key).stem.casefold()
+            if stem in seen:
+                raise ValueError(f"Duplicate Surya result stem: {stem}")
+            seen.add(stem)
+            if stem not in normalized:
+                raise ValueError(f"Surya result has no source image mapping: {raw_page_key}")
+            resolved[entry_index] = normalized[stem]
+        self._entry_indices = resolved
         self._regions = [
             replace(
                 region,
-                page_index=mapping.get(
-                    str(region.provenance.get("raw_page_key", "")),
-                    region.page_index,
-                ),
+                id=f"surya-p{resolved[int(region.provenance['entry_index'])]}-r{sequence}",
+                page_index=resolved[int(region.provenance["entry_index"])],
             )
-            for region in self._regions
+            for sequence, region in enumerate(self._regions, start=1)
         ]
         return self
+
+    def page_indices(self) -> set[int]:
+        return set(self._entry_indices.values())
 
     def pages(self) -> list[int]:
         return sorted({region.page_index for region in self._regions})
