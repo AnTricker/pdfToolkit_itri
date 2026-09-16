@@ -31,9 +31,6 @@ dist/
 .tox/
 .nox/
 
-# Virtual environments
-.venv/
-venv/
 
 # IDE and operating system
 .vscode/
@@ -43,7 +40,12 @@ Thumbs.db
 Desktop.ini
 
 # agents related
+.agents/
 AGENTS.md
 
-# 
-resources/
+/tests/
+
+
+
+# resources
+/resources/
