@@ -15,6 +15,7 @@ from .extract import extract_document
 from .sorting import natural_key
 from .io import write_json
 from .metadata import utc_now, write_metadata
+from .png_to_pdf import convert_folder as convert_png_folder
 from .process import ProcessResult, run_process
 
 
@@ -243,10 +244,12 @@ def _pdf_page_count(input_pdf: Path) -> int:
         document.close()
 
 
-def run_marker(toolkit_root: Path, input_pdf: Path, custom_config: Path | None = None) -> Path:
-    input_pdf = input_pdf.expanduser().resolve()
-    if not input_pdf.is_file() or input_pdf.suffix.lower() != ".pdf":
-        raise ValueError(f"marker requires one PDF file: {input_pdf}")
+def run_marker(toolkit_root: Path, input_path: Path, custom_config: Path | None = None) -> Path:
+    input_path = input_path.expanduser().resolve()
+    is_pdf = input_path.is_file() and input_path.suffix.lower() == ".pdf"
+    source_images = _pngs(input_path) if input_path.is_dir() else []
+    if not is_pdf and not source_images:
+        raise ValueError(f"marker requires one PDF file or PNG folder: {input_path}")
     config = load_config(toolkit_root, custom_config)
     marker_command = config["marker"].get("command")
     if not isinstance(marker_command, list) or not marker_command:
@@ -256,11 +259,37 @@ def run_marker(toolkit_root: Path, input_pdf: Path, custom_config: Path | None =
     if int(config["project"]["heartbeat_seconds"]) <= 0:
         raise ValueError("project.heartbeat_seconds must be greater than zero")
 
-    page_count = _pdf_page_count(input_pdf)
     run_root = allocate_run_root(toolkit_root, config, "marker")
+    if is_pdf:
+        effective_input = input_path
+        page_count = _pdf_page_count(effective_input)
+    else:
+        effective_input = convert_png_folder(input_path, run_root / "input.image-only.pdf")
+        page_count = len(source_images)
+        write_json(
+            run_root / "input_manifest.json",
+            {
+                "input": str(input_path),
+                "effective_input": str(effective_input),
+                "source_type": "png_folder",
+                "pages": [
+                    {"page_index": index, "source_image": str(path.resolve())}
+                    for index, path in enumerate(source_images)
+                ],
+            },
+        )
     logger = EventLogger(run_root, config["logging"].get("redact_keys"))
-    command, native = _marker_command(config, input_pdf, run_root)
-    write_json(run_root / "command.json", {"command": command, "native_command": native, "marker": config["marker"]})
+    command, native = _marker_command(config, effective_input, run_root)
+    write_json(
+        run_root / "command.json",
+        {
+            "command": command,
+            "native_command": native,
+            "input": str(input_path),
+            "effective_input": str(effective_input),
+            "marker": config["marker"],
+        },
+    )
     environment = _environment_payload(config)
     environment.update({
         "marker_environment": config["marker"]["environment"],
@@ -268,7 +297,8 @@ def run_marker(toolkit_root: Path, input_pdf: Path, custom_config: Path | None =
     })
     write_json(run_root / "environment.json", environment)
     status: dict[str, Any] = {
-        "mode": "marker", "state": "running", "input": str(input_pdf),
+        "mode": "marker", "state": "running", "input": str(input_path),
+        "effective_input": str(effective_input),
         "page_count": page_count, "started_at": datetime.now(timezone.utc).isoformat(),
     }
     write_json(run_root / "status.json", status)
@@ -284,8 +314,15 @@ def run_marker(toolkit_root: Path, input_pdf: Path, custom_config: Path | None =
         )
         if process_result.exit_code != 0:
             raise RuntimeError(f"Marker exited with code {process_result.exit_code}")
-        required = ("result.json", "result.md", "result_meta.json", "block_provenance.json")
-        missing = [name for name in required if not (run_root / name).is_file()]
+        required = (
+            Path("result.json"),
+            Path("result.md"),
+            Path("result_meta.json"),
+            Path("block_provenance.json"),
+            Path("result/DocumentBuilder.json"),
+            Path("result/PdfConverter.build_document.json"),
+        )
+        missing = [str(path) for path in required if not (run_root / path).is_file()]
         if missing:
             raise RuntimeError(f"Marker did not produce required output: {', '.join(missing)}")
         status.update({

@@ -68,7 +68,14 @@ def build_surya_assets(
                         "coordinate_space": region.coordinates.space,
                         "render_bbox": list(pixels),
                         "exact_crop": relative_to(crop_path, result_root),
-                        "text": region.text, "provenance": region.provenance,
+                        "text": region.text,
+                        "reading_order": region.reading_order,
+                        "polygon": region.polygon,
+                        "raw_label": region.raw_label,
+                        "confidence": region.confidence,
+                        "skipped": region.skipped,
+                        "error": region.error,
+                        "provenance": region.provenance,
                     }
                 except Exception as exc:
                     index["warnings"].append({"region_id": region.id, "detail": str(exc)})

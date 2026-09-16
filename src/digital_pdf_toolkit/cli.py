@@ -21,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     surya2.add_argument("input", type=Path)
     surya2.add_argument("--config", type=Path)
 
-    marker = modes.add_parser("marker", help="Run Marker against one PDF")
+    marker = modes.add_parser("marker", help="Run Marker against one PDF or PNG folder")
     marker.add_argument("input", type=Path)
     marker.add_argument("--config", type=Path)
     return parser

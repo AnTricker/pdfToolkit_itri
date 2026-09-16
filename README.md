@@ -110,17 +110,23 @@ events.jsonl
 
 ```bash
 ./scripts/linux/marker.sh document.pdf
+./scripts/linux/marker.sh png-folder
 ./scripts/linux/marker.sh document.pdf --config config/custom.yml
 ```
 
-Marker 僅接受單一 PDF，分析一次後輸出官方 JSON、Markdown 與原生擷取圖片。`block_provenance.json` 額外保存每個 block 的 Marker `text_extraction_method`，並將 `surya` 標示為 `ocr`：
+Marker 接受單一 PDF 或僅含第一層 PNG 的 folder。PNG folder 會依 natural order 轉成保留於 output 的 `input.image-only.pdf`，再交由 Marker 分析。除了官方 JSON、Markdown 與原生擷取圖片外，`result/` 保存 Marker 兩個原始 Document 階段；`block_provenance.json` 保存兩階段的 `text_extraction_method`，並將 `surya` 標示為 `ocr`：
 
 ```text
 output/MMDDHHmm_marker/
 ├─ result.json
 ├─ result.md
 ├─ result_meta.json
+├─ result/
+│  ├─ DocumentBuilder.json
+│  └─ PdfConverter.build_document.json
 ├─ block_provenance.json
+├─ input.image-only.pdf       # 僅 PNG folder 輸入
+├─ input_manifest.json        # 僅 PNG folder 輸入
 ├─ <Marker 原生圖片>
 ├─ metadata/
 ├─ command.json

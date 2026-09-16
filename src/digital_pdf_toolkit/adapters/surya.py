@@ -22,10 +22,12 @@ class SuryaRunReader(AnalysisRunReader):
         self.path = results_path
         self.document = read_json(results_path)
         self._entries = list(self._page_values())
-        self._entry_indices = {index: inferred for index, (_, inferred, _) in enumerate(self._entries)}
+        self._entry_indices = {
+            index: inferred for index, (_, inferred, _, _) in enumerate(self._entries)
+        }
         self._regions = list(self._parse())
 
-    def _page_values(self) -> Iterable[tuple[str, int, dict[str, Any]]]:
+    def _page_values(self) -> Iterable[tuple[str, int, int, dict[str, Any]]]:
         if isinstance(self.document, dict):
             fallback = 0
             for key, value in self.document.items():
@@ -35,23 +37,23 @@ class SuryaRunReader(AnalysisRunReader):
                 if isinstance(value, list):
                     for offset, page in enumerate(value):
                         if isinstance(page, dict):
-                            yield raw_page_key, inferred + offset, page
+                            yield raw_page_key, inferred + offset, offset, page
                             fallback += 1
         elif isinstance(self.document, list):
             yield from (
-                (str(index), index, page)
+                (str(index), index, index, page)
                 for index, page in enumerate(self.document)
                 if isinstance(page, dict)
             )
 
     def _parse(self) -> Iterable[AnalysisRegion]:
         sequence = 0
-        for entry_index, (raw_page_key, inferred_page, page) in enumerate(self._entries):
+        for entry_index, (raw_page_key, _, page_entry_index, page) in enumerate(self._entries):
             page_index = self._entry_indices[entry_index]
             image_bbox = box_from(page.get("image_bbox")) or [0.0, 0.0, 1.0, 1.0]
             source_width = image_bbox[2] - image_bbox[0]
             source_height = image_bbox[3] - image_bbox[1]
-            for box in page.get("bboxes", page.get("blocks", [])):
+            for block_index, box in enumerate(page.get("bboxes", page.get("blocks", []))):
                 if not isinstance(box, dict):
                     continue
                 bbox = box_from(box.get("bbox") or box.get("polygon"))
@@ -67,11 +69,18 @@ class SuryaRunReader(AnalysisRunReader):
                     ),
                     text=box.get("text") or box.get("html"),
                     polygon=box.get("polygon"),
+                    reading_order=box.get("reading_order", box.get("position")),
+                    raw_label=box.get("raw_label"),
+                    confidence=box.get("confidence"),
+                    skipped=box.get("skipped"),
+                    error=box.get("error"),
                     provenance={
                         "tool": "surya",
                         "raw_file": str(self.path),
                         "raw_page_key": raw_page_key,
                         "entry_index": entry_index,
+                        "page_entry_index": page_entry_index,
+                        "block_index": block_index,
                     },
                 )
 
@@ -79,7 +88,7 @@ class SuryaRunReader(AnalysisRunReader):
         normalized = {str(key).casefold(): value for key, value in mapping.items()}
         resolved: dict[int, int] = {}
         seen: set[str] = set()
-        for entry_index, (raw_page_key, _, _) in enumerate(self._entries):
+        for entry_index, (raw_page_key, _, _, _) in enumerate(self._entries):
             stem = Path(raw_page_key).stem.casefold()
             if stem in seen:
                 raise ValueError(f"Duplicate Surya result stem: {stem}")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -238,6 +239,9 @@ def test_marker_orchestration_is_flat_and_writes_status(
         run_root = Path(_command[_command.index("--mode") - 1])
         for name in ("result.json", "result.md", "result_meta.json", "block_provenance.json"):
             (run_root / name).write_text("{}", encoding="utf-8")
+        (run_root / "result").mkdir()
+        (run_root / "result" / "DocumentBuilder.json").write_text("{}", encoding="utf-8")
+        (run_root / "result" / "PdfConverter.build_document.json").write_text("{}", encoding="utf-8")
         return ProcessResult(0, 0.25, "start", "finish", [], ["no hardware sampler"])
 
     monkeypatch.setattr(runs, "run_process", fake_process)
@@ -249,3 +253,61 @@ def test_marker_orchestration_is_flat_and_writes_status(
     assert (output / "metadata" / "summary.json").is_file()
     assert not (output / "attempt").exists()
     assert '"state": "completed"' in (output / "status.json").read_text(encoding="utf-8")
+
+
+def test_marker_png_folder_keeps_image_pdf_manifest_and_natural_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    images = tmp_path / "images"
+    images.mkdir()
+    for name in ("page10.png", "page2.PNG", "page1.png"):
+        _png(images / name)
+    (images / "ignored.jpg").write_bytes(b"ignored")
+    config = _config(tmp_path / "output")
+    monkeypatch.setattr(runs, "load_config", lambda *_: config)
+
+    def fake_convert(input_dir: Path, target: Path) -> Path:
+        assert input_dir == images.resolve()
+        target.write_bytes(b"image-only-pdf")
+        return target
+
+    def fake_process(
+        command: list[str], _cwd: Path, _stdout: Path, _stderr: Path,
+        _logger: object, _heartbeat: int, _interval: float, mode: str = "surya2",
+    ) -> ProcessResult:
+        assert mode == "marker"
+        run_root = Path(command[command.index("--mode") - 1])
+        effective_input = Path(command[command.index(str(run_root)) - 1])
+        assert effective_input == run_root / "input.image-only.pdf"
+        for name in ("result.json", "result.md", "result_meta.json", "block_provenance.json"):
+            (run_root / name).write_text("{}", encoding="utf-8")
+        (run_root / "result").mkdir()
+        (run_root / "result" / "DocumentBuilder.json").write_text("{}", encoding="utf-8")
+        (run_root / "result" / "PdfConverter.build_document.json").write_text("{}", encoding="utf-8")
+        return ProcessResult(0, 0.25, "start", "finish", [], [])
+
+    monkeypatch.setattr(runs, "convert_png_folder", fake_convert)
+    monkeypatch.setattr(runs, "run_process", fake_process)
+
+    output = runs.run_marker(tmp_path, images)
+
+    assert (output / "input.image-only.pdf").read_bytes() == b"image-only-pdf"
+    manifest = json.loads((output / "input_manifest.json").read_text(encoding="utf-8"))
+    assert [Path(page["source_image"]).name for page in manifest["pages"]] == [
+        "page1.png", "page2.PNG", "page10.png",
+    ]
+    command = json.loads((output / "command.json").read_text(encoding="utf-8"))
+    assert command["input"] == str(images.resolve())
+    assert command["effective_input"] == str(output / "input.image-only.pdf")
+    status = json.loads((output / "status.json").read_text(encoding="utf-8"))
+    assert status["input"] == str(images.resolve())
+    assert status["page_count"] == 3
+
+
+def test_marker_rejects_folder_without_top_level_png(tmp_path: Path) -> None:
+    nested = tmp_path / "images" / "nested"
+    nested.mkdir(parents=True)
+    _png(nested / "page.png")
+
+    with pytest.raises(ValueError, match="PDF file or PNG folder"):
+        runs.run_marker(tmp_path, nested.parent)

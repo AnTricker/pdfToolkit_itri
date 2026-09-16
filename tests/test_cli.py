@@ -12,6 +12,8 @@ def test_cli_exposes_extract_surya2_and_marker() -> None:
     assert surya2.command == "surya2"
     marker = parser.parse_args(["marker", "document.pdf"])
     assert marker.command == "marker"
+    marker_images = parser.parse_args(["marker", "images"])
+    assert marker_images.input.name == "images"
 
 
 @pytest.mark.parametrize("legacy", ["pages", "preprocess", "resolution", "analyze", "finalize"])
