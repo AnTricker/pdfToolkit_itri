@@ -90,7 +90,7 @@ def marker_json_value(value: Any) -> Any:
         return [marker_json_value(item) for item in value]
     model_dump = getattr(value, "model_dump", None)
     if callable(model_dump):
-        return marker_json_value(model_dump(mode="python", warnings="error"))
+        return marker_json_value(model_dump(mode="python", warnings=False))
     raise TypeError(f"Marker tree contains unsupported value: {type(value).__name__}")
 
 
