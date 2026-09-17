@@ -14,7 +14,7 @@ from .io import read_json, sha256_file, stable_hash, write_json
 from .sorting import natural_key
 
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 HEADER_TYPES = {"pageheader", "page-header", "header"}
 FOOTER_TYPES = {"pagefooter", "page-footer", "footer"}
 HEADING_TYPES = {"sectionheader", "section-header", "heading", "title"}
@@ -181,6 +181,113 @@ def _readable_image(path: Path | None) -> bool:
         return False
 
 
+def _visual_fingerprint(path: Path, settings: dict[str, Any]) -> dict[str, Any]:
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - dependency validation
+        raise RuntimeError("Visual deduplication requires Pillow and numpy") from exc
+
+    resize = int(settings["resize"])
+    hash_size = int(settings["hash_size"])
+    if resize <= 0 or hash_size <= 0 or hash_size > resize:
+        raise ValueError("visual_dedup requires 0 < hash_size <= resize")
+    with Image.open(path) as source:
+        width, height = source.size
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Image has invalid dimensions: {path}")
+        gray = source.convert("L")
+        hash_image = gray.resize((resize, resize), Image.Resampling.LANCZOS)
+        pixels = np.asarray(hash_image, dtype=np.float64) / 255.0
+
+        sharp_image = gray.copy()
+        sharp_image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+        sharp_pixels = np.asarray(sharp_image, dtype=np.float32)
+
+    positions = np.arange(resize, dtype=np.float64)
+    frequencies = np.arange(resize, dtype=np.float64)[:, None]
+    basis = np.cos(np.pi * (2.0 * positions + 1.0) * frequencies / (2.0 * resize))
+    basis[0, :] *= 1.0 / np.sqrt(2.0)
+    basis *= np.sqrt(2.0 / resize)
+    coefficients = basis @ pixels @ basis.T
+    low_frequency = coefficients[:hash_size, :hash_size]
+    median_source = low_frequency.reshape(-1)[1:]
+    threshold = float(np.median(median_source)) if median_source.size else float(low_frequency[0, 0])
+    bits = (low_frequency > threshold).reshape(-1)
+    hash_value = 0
+    for bit in bits:
+        hash_value = (hash_value << 1) | int(bit)
+
+    if sharp_pixels.shape[0] >= 3 and sharp_pixels.shape[1] >= 3:
+        center = sharp_pixels[1:-1, 1:-1]
+        laplacian = (
+            4.0 * center
+            - sharp_pixels[:-2, 1:-1]
+            - sharp_pixels[2:, 1:-1]
+            - sharp_pixels[1:-1, :-2]
+            - sharp_pixels[1:-1, 2:]
+        )
+        sharpness = float(np.var(laplacian))
+    else:
+        sharpness = 0.0
+    bit_count = hash_size * hash_size
+    return {
+        "phash": hash_value,
+        "phash_hex": f"{hash_value:0{(bit_count + 3) // 4}x}",
+        "width": width,
+        "height": height,
+        "area": width * height,
+        "aspect_ratio": width / height,
+        "sharpness": sharpness,
+    }
+
+
+def _hamming_distance(left: int, right: int) -> int:
+    return (left ^ right).bit_count()
+
+
+def _visual_match(left: dict[str, Any], right: dict[str, Any], settings: dict[str, Any]) -> bool:
+    ratio_delta = abs(left["aspect_ratio"] - right["aspect_ratio"]) / max(
+        left["aspect_ratio"], right["aspect_ratio"],
+    )
+    return (
+        ratio_delta <= float(settings["aspect_ratio_tolerance"])
+        and _hamming_distance(left["phash"], right["phash"])
+        <= int(settings["hamming_threshold"])
+    )
+
+
+def _cluster_visual_candidates(
+    candidates: list[dict[str, Any]], settings: dict[str, Any],
+) -> list[list[dict[str, Any]]]:
+    ordered = sorted(candidates, key=lambda candidate: (
+        int(candidate["region"].get("page_index", 0)),
+        _reading_order(candidate["region"]),
+        natural_key(Path(candidate["id"])),
+    ))
+    if not bool(settings.get("enabled", True)):
+        return [[candidate] for candidate in ordered]
+    clusters: list[list[dict[str, Any]]] = []
+    for candidate in ordered:
+        for cluster in clusters:
+            if all(_visual_match(candidate["visual"], member["visual"], settings) for member in cluster):
+                cluster.append(candidate)
+                break
+        else:
+            clusters.append([candidate])
+    return clusters
+
+
+def _representative(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    return sorted(entries, key=lambda entry: (
+        -int(entry["visual"]["area"]),
+        -float(entry["visual"]["sharpness"]),
+        int(entry["region"].get("page_index", 0)),
+        _reading_order(entry["region"]),
+        natural_key(Path(entry["id"])),
+    ))[0]
+
+
 def _copy_crop_as_png(source: Path, destination: Path) -> None:
     if source.suffix.lower() == ".png":
         shutil.copy2(source, destination)
@@ -206,6 +313,11 @@ def _base_metadata(
         "reading_order_end": max(orders) if orders else None,
         "heading_path": list(heading_path),
         "source_indexes": list(dict.fromkeys(str(entry["index_path"]) for entry in entries)),
+        "skipped": any(bool(entry["region"].get("skipped")) for entry in entries),
+        "error": next(
+            (entry["region"].get("error") for entry in entries if entry["region"].get("error")),
+            False,
+        ),
     }
     if len(pages) > 1:
         metadata["page_indexes"] = pages
@@ -255,7 +367,95 @@ def _provenance_record(entry: dict[str, Any], warning: str | None = None) -> dic
     return record
 
 
-def prepare_records(index_paths: list[Path], preprocess: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+def _image_record(
+    entries: list[dict[str, Any]],
+    representative: dict[str, Any],
+    settings: dict[str, Any],
+    aggregate: bool,
+) -> dict[str, Any]:
+    ordered = sorted(entries, key=lambda entry: (
+        int(entry["region"].get("page_index", 0)),
+        _reading_order(entry["region"]),
+        natural_key(Path(entry["id"])),
+    ))
+    metadata = _base_metadata("document_root" if aggregate else "region", ordered, [])
+    metadata["route"] = "image_vector"
+    metadata["raw_labels"] = list(dict.fromkeys(
+        str(entry["region"].get("raw_label"))
+        for entry in ordered
+        if entry["region"].get("raw_label") is not None
+    ))
+    representative_hash = int(representative["visual"]["phash"])
+    metadata["source_regions"] = [
+        {
+            "region_id": entry["id"],
+            "page_index": int(entry["region"].get("page_index", 0)),
+            "reading_order": _reading_order(entry["region"]),
+            "type": entry["region"].get("type"),
+            "raw_label": entry["region"].get("raw_label"),
+            "confidence": entry["region"].get("confidence"),
+            "skipped": bool(entry["region"].get("skipped")),
+            "error": entry["region"].get("error"),
+            "crop": entry["region"].get("exact_crop"),
+            "source_provenance": entry["region"].get("provenance"),
+            "phash": entry["visual"]["phash_hex"],
+            "hamming_distance_to_representative": _hamming_distance(
+                int(entry["visual"]["phash"]), representative_hash,
+            ),
+        }
+        for entry in ordered
+    ]
+    metadata["representative_region_id"] = representative["id"]
+    metadata["representative_selection"] = (
+        "largest_area_then_highest_laplacian_variance_then_earliest_page_"
+        "reading_order_region_id"
+    )
+    metadata["visual_dedup"] = {
+        "algorithm": f"phash-{int(settings['hash_size']) ** 2}",
+        "linkage": "complete",
+        "resize": int(settings["resize"]),
+        "hash_size": int(settings["hash_size"]),
+        "hamming_threshold": int(settings["hamming_threshold"]),
+        "aspect_ratio_tolerance": float(settings["aspect_ratio_tolerance"]),
+        "min_distinct_pages": int(settings["min_distinct_pages"]),
+        "cluster_size": len(ordered),
+        "distinct_page_count": len({int(entry["region"].get("page_index", 0)) for entry in ordered}),
+    }
+    record = {
+        "id": "",
+        "embedding_text": _decorate_embedding_text("", metadata["types"], []),
+        "plain_text": "",
+        "raw_html": "\n".join(str(entry["region"].get("text") or "") for entry in ordered),
+        "metadata": metadata,
+        "vector_ref": None,
+        "_image_source": representative["_image_source"],
+    }
+    record["id"] = _record_id(record)
+    return record
+
+
+def _visual_settings(preprocess: dict[str, Any]) -> dict[str, Any]:
+    settings = {
+        "enabled": True,
+        "hash_size": 8,
+        "resize": 32,
+        "hamming_threshold": 6,
+        "aspect_ratio_tolerance": 0.05,
+        "min_distinct_pages": 3,
+    }
+    settings.update(preprocess.get("visual_dedup") or {})
+    if int(settings["hamming_threshold"]) < 0:
+        raise ValueError("visual_dedup.hamming_threshold must be non-negative")
+    if float(settings["aspect_ratio_tolerance"]) < 0:
+        raise ValueError("visual_dedup.aspect_ratio_tolerance must be non-negative")
+    if int(settings["min_distinct_pages"]) < 1:
+        raise ValueError("visual_dedup.min_distinct_pages must be at least 1")
+    return settings
+
+
+def prepare_records(
+    index_paths: list[Path], preprocess: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str], dict[str, int]]:
     entries: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for index_path in index_paths:
@@ -281,8 +481,10 @@ def prepare_records(index_paths: list[Path], preprocess: dict[str, Any]) -> tupl
     persist_headings = bool(preprocess.get("persist_headings_across_pages", True))
     text_enabled = bool(preprocess.get("text_when_nonempty", True))
     image_enabled = bool(preprocess.get("image_when_text_empty", True))
+    visual_settings = _visual_settings(preprocess)
     warnings: list[str] = []
     records: list[dict[str, Any]] = []
+    visual_candidates: list[dict[str, Any]] = []
     page_groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
     repeated: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     heading_stack: list[str] = []
@@ -297,7 +499,7 @@ def prepare_records(index_paths: list[Path], preprocess: dict[str, Any]) -> tupl
         region_type = _normalized_type(region)
         raw_html = str(region.get("text") or "")
         plain_text, _ = parse_surya_text(raw_html)
-        if region.get("skipped") or region.get("error"):
+        if region.get("error"):
             records.append(_provenance_record(entry))
             continue
         if plain_text and not text_enabled:
@@ -320,10 +522,10 @@ def prepare_records(index_paths: list[Path], preprocess: dict[str, Any]) -> tupl
             continue
 
         crop = _crop_path(entry["index_path"], region)
-        record = _provenance_record(entry)
         if image_enabled and _readable_image(crop):
-            record["_image_source"] = crop
-            record["metadata"]["route"] = "image_vector"
+            candidate = {**entry, "_image_source": crop}
+            candidate["visual"] = _visual_fingerprint(crop, visual_settings)
+            visual_candidates.append(candidate)
         else:
             warning = (
                 f"Region {entry['id']} image embedding is disabled"
@@ -331,8 +533,28 @@ def prepare_records(index_paths: list[Path], preprocess: dict[str, Any]) -> tupl
                 else f"Region {entry['id']} has no usable text or crop"
             )
             warnings.append(warning)
-            record["metadata"]["warning"] = warning
-        records.append(record)
+            records.append(_provenance_record(entry, warning))
+
+    clusters = _cluster_visual_candidates(visual_candidates, visual_settings)
+    aggregate_cluster_count = 0
+    deduplicated_region_count = 0
+    for cluster in clusters:
+        distinct_pages = {int(entry["region"].get("page_index", 0)) for entry in cluster}
+        aggregate = (
+            bool(visual_settings["enabled"])
+            and len(distinct_pages) >= int(visual_settings["min_distinct_pages"])
+        )
+        if aggregate:
+            aggregate_cluster_count += 1
+            deduplicated_region_count += len(cluster) - 1
+            records.append(_image_record(
+                cluster, _representative(cluster), visual_settings, aggregate=True,
+            ))
+        else:
+            records.extend(
+                _image_record([entry], entry, visual_settings, aggregate=False)
+                for entry in cluster
+            )
 
     for page_index in sorted(page_groups):
         group = page_groups[page_index]
@@ -350,7 +572,13 @@ def prepare_records(index_paths: list[Path], preprocess: dict[str, Any]) -> tupl
         record["metadata"].get("reading_order_start") if record["metadata"].get("reading_order_start") is not None else -1,
         record["id"],
     ))
-    return records, warnings
+    visual_stats = {
+        "visual_candidates": len(visual_candidates),
+        "visual_clusters": len(clusters),
+        "aggregate_visual_clusters": aggregate_cluster_count,
+        "deduplicated_image_regions": deduplicated_region_count,
+    }
+    return records, warnings, visual_stats
 
 
 def _as_matrix(value: Any, expected_rows: int, dimension: int, label: str) -> Any:
@@ -415,7 +643,7 @@ def build_knowledge_base(
         raise RuntimeError("Embedding output requires numpy") from exc
 
     indexes = discover_surya_indexes(input_path)
-    records, warnings = prepare_records(indexes, config.get("embedding_preprocess", {}))
+    records, warnings, visual_stats = prepare_records(indexes, config.get("embedding_preprocess", {}))
     records = _split_long_text_records(records, embedder)
     text_records = [record for record in records if record["metadata"].get("route") == "text_vector"]
     image_records = [record for record in records if record["metadata"].get("route") == "image_vector"]
@@ -446,7 +674,9 @@ def build_knowledge_base(
         np.save(temporary / "vectors" / "image.npy", image_matrix)
         for record in image_records:
             source = Path(record.pop("_image_source"))
-            region_id = record["metadata"]["region_ids"][0]
+            region_id = record["metadata"].get(
+                "representative_region_id", record["metadata"]["region_ids"][0],
+            )
             if Path(region_id).name != region_id:
                 raise ValueError(f"Unsafe Surya region ID for crop filename: {region_id}")
             destination = temporary / "crops" / f"{region_id}.png"
@@ -490,6 +720,7 @@ def build_knowledge_base(
                 "image_vectors": len(image_records),
                 "provenance_only": len(records) - len(text_records) - len(image_records),
                 "warnings": len(warnings),
+                **visual_stats,
             },
             "warnings": warnings,
             "files": file_hashes,
