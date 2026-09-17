@@ -15,6 +15,13 @@ scripts\windows\setup.cmd
 
 建立／更新 `digital-pdf-core`、`digital-pdf-surya` 與 `digital-pdf-marker`。
 
+ROCm embedding 環境需明確指定與主機相容的 PyTorch wheel index，避免誤裝其他 build：
+
+```bash
+PYTORCH_ROCM_INDEX_URL=https://download.pytorch.org/whl/rocm6.4 \
+  ./scripts/linux/setup-embedding.sh
+```
+
 ## Commands
 
 ### HEIC to PNG
@@ -140,6 +147,28 @@ output/MMDDHHmm_marker/
 
 Marker 預設固定使用 `balanced` mode，並透過 `llama.cpp` 的 `llama-server` 執行 Surya VLM；不啟用額外 LLM、強制 OCR、額外 crop 或 embedding normalization。
 
+---
+### Qwen3VL embedding
+
+```bash
+./scripts/linux/qwen3vl.sh output/MMDDHHmm_surya2
+./scripts/linux/qwen3vl.sh output/MMDDHHmm_surya2/1/assets/index.json --config config/local.yml
+```
+
+接受單一 Surya `assets/index.json`、單批 run 或數字 batch run。OCR 文字非空時只建立 `text_vector`；文字為空且 crop 可讀時才建立 `image_vector` 並複製 crop：
+
+```text
+output/MMDDHHmm_qwen3vl/knowledge_base/
+├─ manifest.json
+├─ records.jsonl
+├─ vectors/
+│  ├─ text.npy
+│  └─ image.npy
+└─ crops/
+```
+
+模型與 runtime 設定在 `config/embedding.yml`，可由 `config/local.yml` 或 `--config` 覆寫。`HF_TOKEN`、`HF_HOME` 等主機值由 shell／deployment environment 注入，不寫入 YAML。
+
 ## Output naming
 
 Run folder 使用本機時間 `MMDDHHmm_<mode>`。同分鐘、同 mode 的後續 run 依序使用 `_02`、`_03`。
@@ -149,6 +178,7 @@ Run folder 使用本機時間 `MMDDHHmm_<mode>`。同分鐘、同 mode 的後續
 - `config/default.yml`：output root、render DPI、heartbeat、metadata sampling 與 logging。
 - `config/surya2.yml`：Surya environment、version 與實際 native command。
 - `config/marker.yml`：Marker environment、version 與 worker command。
+- `config/embedding.yml`：embedding mode、model adapter、runtime 與 preprocessing。
 - `--config` 指定的 YAML 最後套用，可覆蓋以上設定。
 
 Batch size 固定為 10，不開放調整。

@@ -24,12 +24,15 @@ def build_parser() -> argparse.ArgumentParser:
     marker = modes.add_parser("marker", help="Run Marker against one PDF or PNG folder")
     marker.add_argument("input", type=Path)
     marker.add_argument("--config", type=Path)
+    qwen3vl = modes.add_parser("qwen3vl", help="Build an embedding knowledge base from Surya assets")
+    qwen3vl.add_argument("input", type=Path)
+    qwen3vl.add_argument("--config", type=Path)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    from .runs import run_extract, run_marker, run_surya2
+    from .runs import run_extract, run_marker, run_qwen3vl, run_surya2
 
     try:
         if args.command == "extract":
@@ -38,6 +41,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "marker":
             output = run_marker(toolkit_root(), args.input, args.config)
+            print(f"Output: {output}")
+            return 0
+        if args.command == "qwen3vl":
+            output = run_qwen3vl(toolkit_root(), args.input, args.config)
             print(f"Output: {output}")
             return 0
         output, failed_batches = run_surya2(toolkit_root(), args.input, args.config)

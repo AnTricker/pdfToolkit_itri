@@ -1,0 +1,503 @@
+from __future__ import annotations
+
+import html
+import json
+import re
+import shutil
+from collections import defaultdict
+from copy import deepcopy
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Protocol
+
+from .io import read_json, sha256_file, stable_hash, write_json
+from .sorting import natural_key
+
+
+SCHEMA_VERSION = "1.0"
+HEADER_TYPES = {"pageheader", "page-header", "header"}
+FOOTER_TYPES = {"pagefooter", "page-footer", "footer"}
+HEADING_TYPES = {"sectionheader", "section-header", "heading", "title"}
+
+
+class Embedder(Protocol):
+    model_id: str
+    revision: str | None
+    dimension: int
+    dtype: str
+    normalize_embeddings: bool
+
+    def encode_texts(self, values: list[str]) -> Any: ...
+
+    def encode_images(self, values: list[Path]) -> Any: ...
+
+    def split_text(self, value: str) -> list[str]: ...
+
+
+def discover_surya_indexes(input_path: Path) -> list[Path]:
+    value = input_path.expanduser().resolve()
+    if value.is_file():
+        if value.name != "index.json" or value.parent.name != "assets":
+            raise ValueError(f"Expected a Surya assets/index.json: {value}")
+        return [value]
+    if not value.is_dir():
+        raise ValueError(f"Surya run or assets index does not exist: {value}")
+
+    direct = [value / "assets" / "index.json", value / "result" / "assets" / "index.json"]
+    found = [path for path in direct if path.is_file()]
+    numeric = sorted(
+        (path for path in value.iterdir() if path.is_dir() and path.name.isdigit()),
+        key=lambda path: int(path.name),
+    )
+    batch_indexes = [path / "assets" / "index.json" for path in numeric]
+    if found and batch_indexes:
+        raise ValueError(f"Ambiguous Surya run layout: {value}")
+    if batch_indexes:
+        missing = [path for path in batch_indexes if not path.is_file()]
+        if missing:
+            raise ValueError(f"Missing batch assets index: {missing[0]}")
+        return batch_indexes
+    if len(found) == 1:
+        return found
+    raise ValueError(f"No Surya assets/index.json found under: {value}")
+
+
+def _collapse_space(value: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(value)).strip()
+
+
+def _table_markdown(table: Any) -> str:
+    rows: list[list[str]] = []
+    for row in table.find_all("tr"):
+        cells = [_collapse_space(cell.get_text(" ", strip=True)) for cell in row.find_all(["th", "td"])]
+        if cells:
+            rows.append(cells)
+    if not rows:
+        return ""
+    width = max(len(row) for row in rows)
+    rows = [row + [""] * (width - len(row)) for row in rows]
+    escaped = [[cell.replace("|", "\\|") for cell in row] for row in rows]
+    output = ["| " + " | ".join(escaped[0]) + " |", "| " + " | ".join(["---"] * width) + " |"]
+    output.extend("| " + " | ".join(row) + " |" for row in escaped[1:])
+    return "\n".join(output)
+
+
+def parse_surya_text(raw_html: str) -> tuple[str, str]:
+    """Return normalized plain text and structure-aware, model-neutral text."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as exc:  # pragma: no cover - dependency validation
+        raise RuntimeError("Embedding preprocessing requires beautifulsoup4") from exc
+
+    source = raw_html or ""
+    soup = BeautifulSoup(source, "html.parser")
+    plain_text = _collapse_space(soup.get_text(" ", strip=True))
+    tables = [_table_markdown(table) for table in soup.find_all("table")]
+    tables = [table for table in tables if table]
+    lists = []
+    for list_node in soup.find_all(["ul", "ol"]):
+        ordered = list_node.name == "ol"
+        items = []
+        for index, item in enumerate(list_node.find_all("li", recursive=False), start=1):
+            prefix = f"{index}." if ordered else "-"
+            items.append(f"{prefix} {_collapse_space(item.get_text(' ', strip=True))}")
+        if items:
+            lists.append("\n".join(items))
+    remainder = BeautifulSoup(source, "html.parser")
+    for node in remainder.find_all(["table", "ul", "ol"]):
+        node.decompose()
+    ordinary = _collapse_space(remainder.get_text(" ", strip=True))
+    structured = "\n\n".join(value for value in [ordinary, *lists, *tables] if value)
+    return plain_text, structured or plain_text
+
+
+def _normalized_type(region: dict[str, Any]) -> str:
+    return str(region.get("type") or region.get("raw_label") or "unknown").strip().lower()
+
+
+def _reading_order(region: dict[str, Any]) -> int:
+    value = region.get("reading_order")
+    if value is None:
+        value = region.get("provenance", {}).get("block_index", 10**9)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 10**9
+
+
+def _heading_level(raw_html: str, plain_text: str) -> int:
+    match = re.search(r"<h([1-6])\b", raw_html, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    numbered = re.match(r"^\s*(\d+(?:\.\d+)*)[.、]?\s+", plain_text)
+    return len(numbered.group(1).split(".")) if numbered else 1
+
+
+def _update_heading_stack(stack: list[str], text: str, level: int) -> list[str]:
+    level = max(1, level)
+    stack = stack[: level - 1]
+    while len(stack) < level - 1:
+        stack.append("")
+    stack.append(text)
+    return [value for value in stack if value]
+
+
+def _record_id(payload: dict[str, Any]) -> str:
+    identity = {
+        "scope": payload["metadata"].get("scope"),
+        "region_ids": payload["metadata"].get("region_ids", []),
+        "page_index": payload["metadata"].get("page_index"),
+        "plain_text": payload.get("plain_text", ""),
+        "chunk_index": payload["metadata"].get("chunk_index"),
+    }
+    return f"qwen3vl-{stable_hash(identity)[:20]}"
+
+
+def _decorate_embedding_text(body: str, types: list[str], heading_path: list[str]) -> str:
+    labels = [f"[type={','.join(types) if types else 'unknown'}]"]
+    if heading_path:
+        labels.append(f"[section={' > '.join(heading_path)}]")
+    labels.append(body)
+    return "\n".join(value for value in labels if value)
+
+
+def _crop_path(index_path: Path, region: dict[str, Any]) -> Path | None:
+    value = region.get("exact_crop")
+    if not value:
+        return None
+    path = Path(str(value))
+    return path if path.is_absolute() else index_path.parent.parent / path
+
+
+def _readable_image(path: Path | None) -> bool:
+    if path is None or not path.is_file():
+        return False
+    try:
+        from PIL import Image
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except Exception:
+        return False
+
+
+def _copy_crop_as_png(source: Path, destination: Path) -> None:
+    if source.suffix.lower() == ".png":
+        shutil.copy2(source, destination)
+        return
+    from PIL import Image
+    with Image.open(source) as image:
+        image.save(destination, format="PNG")
+
+
+def _base_metadata(
+    scope: str,
+    entries: list[dict[str, Any]],
+    heading_path: list[str],
+) -> dict[str, Any]:
+    orders = [_reading_order(entry["region"]) for entry in entries]
+    pages = sorted({int(entry["region"].get("page_index", 0)) for entry in entries})
+    metadata: dict[str, Any] = {
+        "scope": scope,
+        "region_ids": [entry["id"] for entry in entries],
+        "types": list(dict.fromkeys(_normalized_type(entry["region"]) for entry in entries)),
+        "page_index": pages[0] if len(pages) == 1 else None,
+        "reading_order_start": min(orders) if orders else None,
+        "reading_order_end": max(orders) if orders else None,
+        "heading_path": list(heading_path),
+        "source_indexes": list(dict.fromkeys(str(entry["index_path"]) for entry in entries)),
+    }
+    if len(pages) > 1:
+        metadata["page_indexes"] = pages
+    return metadata
+
+
+def _text_record(scope: str, entries: list[dict[str, Any]], heading_path: list[str]) -> dict[str, Any]:
+    raw_html = "\n".join(str(entry["region"].get("text") or "") for entry in entries)
+    parsed = [parse_surya_text(str(entry["region"].get("text") or "")) for entry in entries]
+    plain_text = "\n".join(value[0] for value in parsed if value[0])
+    body = "\n\n".join(value[1] for value in parsed if value[1])
+    metadata = _base_metadata(scope, entries, heading_path)
+    metadata["route"] = "text_vector"
+    record = {
+        "id": "",
+        "embedding_text": _decorate_embedding_text(body, metadata["types"], heading_path),
+        "plain_text": plain_text,
+        "raw_html": raw_html,
+        "metadata": metadata,
+        "vector_ref": None,
+        "_embedding_body": body,
+    }
+    record["id"] = _record_id(record)
+    return record
+
+
+def _provenance_record(entry: dict[str, Any], warning: str | None = None) -> dict[str, Any]:
+    region = entry["region"]
+    raw_html = str(region.get("text") or "")
+    plain_text, structured = parse_surya_text(raw_html)
+    metadata = _base_metadata("region", [entry], [])
+    metadata["skipped"] = bool(region.get("skipped"))
+    metadata["error"] = region.get("error")
+    metadata["source_provenance"] = region.get("provenance")
+    metadata["route"] = "provenance_only"
+    if warning:
+        metadata["warning"] = warning
+    record = {
+        "id": "",
+        "embedding_text": _decorate_embedding_text(structured, metadata["types"], []),
+        "plain_text": plain_text,
+        "raw_html": raw_html,
+        "metadata": metadata,
+        "vector_ref": None,
+    }
+    record["id"] = _record_id(record)
+    return record
+
+
+def prepare_records(index_paths: list[Path], preprocess: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    entries: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index_path in index_paths:
+        payload = read_json(index_path)
+        regions = payload.get("regions")
+        if not isinstance(regions, dict):
+            raise ValueError(f"Surya index regions must be an object: {index_path}")
+        for region_id, region in regions.items():
+            if region_id in seen_ids:
+                raise ValueError(f"Duplicate Surya region ID: {region_id}")
+            if not isinstance(region, dict):
+                raise ValueError(f"Invalid Surya region {region_id}: {index_path}")
+            seen_ids.add(region_id)
+            entries.append({"id": region_id, "region": region, "index_path": index_path})
+
+    entries.sort(key=lambda entry: (
+        int(entry["region"].get("page_index", 0)),
+        _reading_order(entry["region"]),
+        natural_key(Path(entry["id"])),
+    ))
+    independent = {str(value).lower() for value in preprocess.get("independent_text_types", ["table", "form"])}
+    aggregate_repeated = bool(preprocess.get("aggregate_repeated_regions", True))
+    persist_headings = bool(preprocess.get("persist_headings_across_pages", True))
+    text_enabled = bool(preprocess.get("text_when_nonempty", True))
+    image_enabled = bool(preprocess.get("image_when_text_empty", True))
+    warnings: list[str] = []
+    records: list[dict[str, Any]] = []
+    page_groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    repeated: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    heading_stack: list[str] = []
+    current_page: int | None = None
+
+    for entry in entries:
+        region = entry["region"]
+        page_index = int(region.get("page_index", 0))
+        if current_page is not None and page_index != current_page and not persist_headings:
+            heading_stack = []
+        current_page = page_index
+        region_type = _normalized_type(region)
+        raw_html = str(region.get("text") or "")
+        plain_text, _ = parse_surya_text(raw_html)
+        if region.get("skipped") or region.get("error"):
+            records.append(_provenance_record(entry))
+            continue
+        if plain_text and not text_enabled:
+            warning = f"Region {entry['id']} text embedding is disabled"
+            warnings.append(warning)
+            records.append(_provenance_record(entry, warning))
+            continue
+        if region_type in HEADER_TYPES | FOOTER_TYPES and plain_text and aggregate_repeated:
+            repeated[(region_type, _collapse_space(plain_text).casefold())].append(entry)
+            continue
+        if region_type in HEADING_TYPES and plain_text:
+            level = _heading_level(raw_html, plain_text)
+            heading_stack = _update_heading_stack(heading_stack, plain_text, level)
+            continue
+        if plain_text:
+            if region_type in independent:
+                records.append(_text_record("region", [entry], heading_stack))
+            else:
+                page_groups[int(region.get("page_index", 0))].append({**entry, "heading_path": list(heading_stack)})
+            continue
+
+        crop = _crop_path(entry["index_path"], region)
+        record = _provenance_record(entry)
+        if image_enabled and _readable_image(crop):
+            record["_image_source"] = crop
+            record["metadata"]["route"] = "image_vector"
+        else:
+            warning = (
+                f"Region {entry['id']} image embedding is disabled"
+                if not image_enabled
+                else f"Region {entry['id']} has no usable text or crop"
+            )
+            warnings.append(warning)
+            record["metadata"]["warning"] = warning
+        records.append(record)
+
+    for page_index in sorted(page_groups):
+        group = page_groups[page_index]
+        if not group:
+            continue
+        heading_path = group[-1].get("heading_path", [])
+        records.append(_text_record("page", group, heading_path))
+
+    for (_, _), group in sorted(repeated.items(), key=lambda item: (_normalized_type(item[1][0]["region"]), item[0][1])):
+        heading_path: list[str] = []
+        records.append(_text_record("document_root", group, heading_path))
+
+    records.sort(key=lambda record: (
+        record["metadata"].get("page_index") if record["metadata"].get("page_index") is not None else -1,
+        record["metadata"].get("reading_order_start") if record["metadata"].get("reading_order_start") is not None else -1,
+        record["id"],
+    ))
+    return records, warnings
+
+
+def _as_matrix(value: Any, expected_rows: int, dimension: int, label: str) -> Any:
+    try:
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover - dependency validation
+        raise RuntimeError("Embedding output requires numpy") from exc
+    matrix = np.asarray(value)
+    if matrix.shape != (expected_rows, dimension):
+        raise ValueError(f"{label} embeddings have shape {matrix.shape}; expected {(expected_rows, dimension)}")
+    if not np.isfinite(matrix).all():
+        raise ValueError(f"{label} embeddings contain non-finite values")
+    return matrix
+
+
+def _finalize_matrix(matrix: Any, dtype: str, normalize: bool, label: str) -> Any:
+    import numpy as np
+    matrix = matrix.astype(np.dtype(dtype), copy=False)
+    if normalize and matrix.shape[0]:
+        work = matrix.astype(np.float32, copy=False)
+        norms = np.linalg.norm(work, axis=1, keepdims=True)
+        if (norms == 0).any():
+            raise ValueError(f"{label} embeddings contain a zero vector")
+        matrix = (work / norms).astype(np.dtype(dtype), copy=False)
+    return matrix
+
+
+def _split_long_text_records(records: list[dict[str, Any]], embedder: Embedder) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for record in records:
+        body = record.pop("_embedding_body", None)
+        if record["metadata"].get("route") != "text_vector" or body is None:
+            output.append(record)
+            continue
+        parts = [part.strip() for part in embedder.split_text(body) if part.strip()]
+        if not parts:
+            raise ValueError(f"Tokenizer produced no content for record {record['id']}")
+        if len(parts) == 1:
+            output.append(record)
+            continue
+        for index, part in enumerate(parts):
+            chunk = deepcopy(record)
+            chunk["metadata"]["chunk_index"] = index
+            chunk["metadata"]["chunk_count"] = len(parts)
+            chunk["embedding_text"] = _decorate_embedding_text(
+                part, chunk["metadata"]["types"], chunk["metadata"]["heading_path"],
+            )
+            chunk["id"] = _record_id(chunk)
+            output.append(chunk)
+    return output
+
+
+def build_knowledge_base(
+    input_path: Path,
+    output_dir: Path,
+    config: dict[str, Any],
+    embedder: Embedder,
+) -> Path:
+    try:
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover - dependency validation
+        raise RuntimeError("Embedding output requires numpy") from exc
+
+    indexes = discover_surya_indexes(input_path)
+    records, warnings = prepare_records(indexes, config.get("embedding_preprocess", {}))
+    records = _split_long_text_records(records, embedder)
+    text_records = [record for record in records if record["metadata"].get("route") == "text_vector"]
+    image_records = [record for record in records if record["metadata"].get("route") == "image_vector"]
+
+    text_values = [record["embedding_text"] for record in text_records]
+    image_values = [Path(record["_image_source"]) for record in image_records]
+    vector_dtype = np.dtype(embedder.dtype)
+    text_matrix = _as_matrix(embedder.encode_texts(text_values), len(text_values), embedder.dimension, "text") if text_values else np.empty((0, embedder.dimension), dtype=vector_dtype)
+    image_matrix = _as_matrix(embedder.encode_images(image_values), len(image_values), embedder.dimension, "image") if image_values else np.empty((0, embedder.dimension), dtype=vector_dtype)
+    text_matrix = _finalize_matrix(text_matrix, embedder.dtype, embedder.normalize_embeddings, "text")
+    image_matrix = _finalize_matrix(image_matrix, embedder.dtype, embedder.normalize_embeddings, "image")
+
+    for row, record in enumerate(text_records):
+        record["vector_ref"] = {"kind": "text_vector", "row": row}
+    for row, record in enumerate(image_records):
+        record["vector_ref"] = {"kind": "image_vector", "row": row}
+
+    target = output_dir / "knowledge_base"
+    temporary = output_dir / ".knowledge_base.tmp"
+    if target.exists():
+        raise FileExistsError(target)
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    (temporary / "vectors").mkdir(parents=True)
+    (temporary / "crops").mkdir()
+    try:
+        np.save(temporary / "vectors" / "text.npy", text_matrix)
+        np.save(temporary / "vectors" / "image.npy", image_matrix)
+        for record in image_records:
+            source = Path(record.pop("_image_source"))
+            region_id = record["metadata"]["region_ids"][0]
+            if Path(region_id).name != region_id:
+                raise ValueError(f"Unsafe Surya region ID for crop filename: {region_id}")
+            destination = temporary / "crops" / f"{region_id}.png"
+            _copy_crop_as_png(source, destination)
+            record["metadata"]["crop"] = destination.relative_to(temporary).as_posix()
+        for record in records:
+            record.pop("_image_source", None)
+            record.pop("_embedding_body", None)
+
+        records_path = temporary / "records.jsonl"
+        with records_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+        file_hashes = {
+            "records.jsonl": sha256_file(records_path),
+            "vectors/text.npy": sha256_file(temporary / "vectors" / "text.npy"),
+            "vectors/image.npy": sha256_file(temporary / "vectors" / "image.npy"),
+        }
+        for crop in sorted((temporary / "crops").iterdir()):
+            file_hashes[crop.relative_to(temporary).as_posix()] = sha256_file(crop)
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "qwen3vl",
+            "model": {
+                "provider": "sentence_transformers",
+                "model_id": embedder.model_id,
+                "revision": embedder.revision,
+                "dimension": embedder.dimension,
+                "dtype": embedder.dtype,
+                "normalize_embeddings": embedder.normalize_embeddings,
+            },
+            "sources": [
+                {"index": str(path), "sha256": sha256_file(path)}
+                for path in indexes
+            ],
+            "counts": {
+                "records": len(records),
+                "text_vectors": len(text_records),
+                "image_vectors": len(image_records),
+                "provenance_only": len(records) - len(text_records) - len(image_records),
+                "warnings": len(warnings),
+            },
+            "warnings": warnings,
+            "files": file_hashes,
+        }
+        write_json(temporary / "manifest.json", manifest)
+        temporary.replace(target)
+    except BaseException:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        raise
+    return target

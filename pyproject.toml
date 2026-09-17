@@ -17,7 +17,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<9"]
+embedding = [
+  "beautifulsoup4>=4.12,<5",
+  "numpy>=2,<3",
+  "sentence-transformers[image]>=5,<6",
+]
+test = ["pytest>=8,<9", "beautifulsoup4>=4.12,<5", "numpy>=2,<3"]
 
 [project.scripts]
 digital-pdf-toolkit = "digital_pdf_toolkit.cli:main"

@@ -12,6 +12,7 @@ from .assets import build_surya_assets
 from .config import load_config
 from .events import EventLogger
 from .extract import extract_document
+from .embedding import discover_surya_indexes
 from .sorting import natural_key
 from .io import write_json
 from .metadata import utc_now, write_metadata
@@ -226,6 +227,109 @@ def _marker_command(config: dict[str, Any], input_pdf: Path, result_root: Path) 
         config["marker"]["environment"], *native,
     ]
     return command, native
+
+
+def _embedding_command(
+    config: dict[str, Any], input_path: Path, run_root: Path, config_json: Path,
+) -> tuple[list[str], list[str]]:
+    replacements = {
+        "input": str(input_path.resolve()),
+        "output_dir": str(run_root.resolve()),
+        "config_json": str(config_json.resolve()),
+    }
+    native = [str(part).format(**replacements) for part in config["embedding"]["command"]]
+    command = [
+        "conda", "run", "--no-capture-output", "-n",
+        config["embedding"]["environment"], *native,
+    ]
+    return command, native
+
+
+def run_qwen3vl(toolkit_root: Path, input_path: Path, custom_config: Path | None = None) -> Path:
+    input_path = input_path.expanduser().resolve()
+    indexes = discover_surya_indexes(input_path)
+    config = load_config(toolkit_root, custom_config)
+    embedding = config.get("embedding", {})
+    if embedding.get("mode") != "qwen3vl":
+        raise ValueError("embedding.mode must be qwen3vl")
+    command_template = embedding.get("command")
+    if not isinstance(command_template, list) or not command_template:
+        raise ValueError("embedding.command must be a non-empty list")
+    settings = embedding.get("modes", {}).get("qwen3vl", {})
+    if int(settings.get("dimension", 0)) <= 0:
+        raise ValueError("qwen3vl dimension must be greater than zero")
+
+    run_root = allocate_run_root(toolkit_root, config, "qwen3vl")
+    config_json = run_root / "resolved_config.json"
+    write_json(config_json, config)
+    command, native = _embedding_command(config, input_path, run_root, config_json)
+    logger = EventLogger(run_root, config["logging"].get("redact_keys"))
+    write_json(run_root / "command.json", {
+        "command": command,
+        "native_command": native,
+        "input": str(input_path),
+        "source_indexes": [str(path) for path in indexes],
+        "embedding": embedding,
+        "embedding_preprocess": config.get("embedding_preprocess", {}),
+    })
+    environment = _environment_payload(config)
+    environment["embedding_environment"] = embedding["environment"]
+    write_json(run_root / "environment.json", environment)
+    status: dict[str, Any] = {
+        "mode": "qwen3vl", "state": "running", "input": str(input_path),
+        "source_index_count": len(indexes), "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json(run_root / "status.json", status)
+    interval = float(config["metadata"]["sampling_interval_seconds"])
+    started_at = utc_now()
+    started = time.monotonic()
+    process_result: ProcessResult | None = None
+    warnings: list[str] = []
+    try:
+        process_result = run_process(
+            command, toolkit_root, run_root / "stdout.log", run_root / "stderr.log",
+            logger, int(config["project"]["heartbeat_seconds"]), interval, mode="qwen3vl",
+        )
+        if process_result.exit_code != 0:
+            raise RuntimeError(f"qwen3vl embedding exited with code {process_result.exit_code}")
+        required = (
+            Path("knowledge_base/manifest.json"),
+            Path("knowledge_base/records.jsonl"),
+            Path("knowledge_base/vectors/text.npy"),
+            Path("knowledge_base/vectors/image.npy"),
+        )
+        missing = [str(path) for path in required if not (run_root / path).is_file()]
+        if missing:
+            raise RuntimeError(f"qwen3vl did not produce required output: {', '.join(missing)}")
+        status.update({
+            "state": "completed", "exit_code": process_result.exit_code,
+            "duration_seconds": round(process_result.duration_seconds, 3),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.emit("qwen3vl", "DONE", f"indexes={len(indexes)}")
+        return run_root
+    except Exception as exc:
+        status.update({
+            "state": "failed", "exit_code": process_result.exit_code if process_result else None,
+            "error": str(exc), "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.emit("qwen3vl", "FAILED", str(exc), level="ERROR")
+        raise
+    finally:
+        duration = process_result.duration_seconds if process_result else time.monotonic() - started
+        samples = process_result.samples if process_result else []
+        warnings.extend(process_result.warnings if process_result else ["Embedding process did not start; hardware samples are unavailable"])
+        try:
+            write_metadata(
+                run_root, command=command, image_count=len(indexes),
+                started_at=process_result.started_at if process_result else started_at,
+                finished_at=process_result.finished_at if process_result else utc_now(), duration=duration,
+                exit_code=process_result.exit_code if process_result else None, samples=samples,
+                warnings=warnings, interval=interval, mode="qwen3vl", workload_unit="source_index",
+            )
+        except Exception as exc:
+            logger.emit("metadata", "WARNING", str(exc))
+        write_json(run_root / "status.json", status)
 
 
 def _pdf_page_count(input_pdf: Path) -> int:
