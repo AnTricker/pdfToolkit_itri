@@ -1,6 +1,10 @@
 # Copy this file to config/local.yml for host-specific overrides.
 # config/local.yml is ignored by Git and loaded after the shipped defaults.
 embedding:
+  # Reserved for process recycling. The current pipeline does not consume this
+  # setting yet; resume a failed run manually with --resume-from.
+  image_worker:
+    max_images_per_process: 250
   modes:
     qwen3vl:
       # Hugging Face model ID or an absolute local SentenceTransformer model directory.

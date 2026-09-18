@@ -150,38 +150,153 @@ Marker 預設固定使用 `balanced` mode，並透過 `llama.cpp` 的 `llama-ser
 ---
 ### Qwen3VL embedding
 
-```bash
-./scripts/linux/qwen3vl.sh output/MMDDHHmm_surya2
-./scripts/linux/qwen3vl.sh output/MMDDHHmm_surya2/1/assets/index.json --config config/local.yml
-./scripts/linux/qwen3vl.sh output/MMDDHHmm_surya2 --resume-from output/MMDDHHmm_qwen3vl
-```
+#### 建立與接續知識庫
 
-接受單一 Surya `assets/index.json`、單批 run 或數字 batch run。OCR 文字非空時只建立 `text_vector`；文字為空且 crop 可讀時才建立 `image_vector` 並複製 crop：
-
-```text
-output/MMDDHHmm_qwen3vl/knowledge_base/
-├─ manifest.json
-├─ records.jsonl
-├─ vectors/
-│  ├─ text.npy
-│  └─ image.npy
-├─ crops/                         # 去重後的原始代表 crop
-└─ embedding_inputs/
-   ├─ metadata.json               # 原圖、resize、model grid 與 vector row 對應
-   └─ <region-id>-overview.png    # 實際送入 image embedding 的圖片
-```
-
-模型與 runtime 設定在 `config/embedding.yml`，可由 `config/local.yml` 或 `--config` 覆寫。`HF_TOKEN`、`HF_HOME` 等主機值由 shell／deployment environment 注入，不寫入 YAML。
-
-建立主機專用設定時，先複製範例再修改；`config/local.yml` 已被 Git 忽略，且會自動覆寫上述預設值：
+先建立主機設定，填入本機模型路徑與 runtime：
 
 ```bash
 cp config/local.example.yml config/local.yml
 ```
 
-若只想覆寫單次執行，可另外建立 YAML 並使用 `--config path/to/override.yml`；其優先序高於 `config/local.yml`。
+`config/local.yml` 已被 Git 忽略。`model_id` 可使用 Hugging Face ID，或已下載模型的絕對路徑：
 
-圖片會逐張建立 checkpoint。若 image embedding 中途失敗，不會發布正式 knowledge base；已建立的 crop、實際模型輸入、metadata 與 vectors 會保留於同一 run 的 `knowledge_base.failed/`。使用 `--resume-from` 可在原 run 內重用已成功 vectors，從失敗圖片接續；resume 強制沿用原本的 `resolved_config.json`，不可同時指定 `--config`。每次接續的 log 另存為 `stdout.resume-NN.log`／`stderr.resume-NN.log`，不覆寫先前紀錄。
+```yaml
+embedding:
+  modes:
+    qwen3vl:
+      model_id: /absolute/path/to/Qwen3-VL-Embedding-8B
+      runtime:
+        device: cuda
+        dtype: float16
+        attention: sdpa
+        batch_size: 1
+```
+
+輸入可為單一 Surya `assets/index.json`、單批 run，或包含數字 batch subfolder 的完整 Surya run：
+
+```bash
+./scripts/linux/qwen3vl.sh output/MMDDHHmm_surya2
+./scripts/linux/qwen3vl.sh output/MMDDHHmm_surya2/1/assets/index.json --config config/local.yml
+```
+
+若 image embedding 中途失敗，使用原 Surya input 與既有 qwen3vl run 接續：
+
+```bash
+./scripts/linux/qwen3vl.sh output/MMDDHHmm_surya2 --resume-from output/MMDDHHmm_qwen3vl
+```
+
+Resume 強制沿用舊 run 的 `resolved_config.json`，不可同時使用 `--config`。已成功的 vectors、crop 與 embedding inputs 不重算；從上一張失敗圖片繼續。
+
+#### Routing 規則
+
+每個 Surya region 依序判斷：
+
+```text
+error
+→ provenance only，不建立 vector
+
+plain_text 非空
+→ text_vector，不複製 crop
+
+plain_text 為空且 crop 可讀
+→ image_vector，保存代表 crop 與實際模型輸入圖
+
+plain_text 為空且 crop 不可用
+→ provenance only＋warning
+```
+
+文字以頁面為主要 chunk；table/form 等獨立文字 region 不會再重複放入頁面正文。Heading 透過 `heading_path` 跨頁延續；重複 header/footer 聚合為 `document_root` record。重複純圖片先經 pHash 去重，再對代表圖建立一個 image vector。
+
+#### Output 結構
+
+成功時：
+
+```text
+output/MMDDHHmm_qwen3vl/
+├─ resolved_config.json
+├─ command.json
+├─ status.json
+├─ stdout.log / stderr.log
+└─ knowledge_base/
+   ├─ manifest.json
+   ├─ records.jsonl
+   ├─ vectors/
+   │  ├─ text.npy
+   │  └─ image.npy
+   ├─ crops/
+   │  └─ <source-image-id>.png
+   └─ embedding_inputs/
+      ├─ metadata.json
+      └─ <source-image-id>-overview.png
+```
+
+失敗時不會發布 `knowledge_base/`，checkpoint 會保存在 `knowledge_base.failed/`。每次 resume 另外產生 `stdout.resume-NN.log`、`stderr.resume-NN.log`、`command.resume-NN.json` 與 `resume-NN/metadata/`；`status.json.attempts` 保留每次執行狀態。若 process 被強制中止，可能留下可接續的 `.knowledge_base.tmp/`。
+
+#### 檔案用途與對應方式
+
+- `manifest.json`：保存 schema/model/revision、dimension、dtype、normalization、來源 index hash、record/vector 數量、warnings 與所有 KB artifact hash。
+- `records.jsonl`：每行一筆可檢索 record；保留處理後文字、來源 metadata 及 vector row。
+- `vectors/text.npy`：所有 `text_vector`，shape 為 `(text_count, dimension)`。
+- `vectors/image.npy`：所有 `image_vector`，shape 為 `(image_count, dimension)`。
+- `crops/`：只有建立 image vector 的純圖 region；保存去重後的原始代表 crop。
+- `embedding_inputs/*-overview.png`：EXIF transpose、RGB conversion 與 resize 後，實際送入模型的圖片。
+- `embedding_inputs/metadata.json`：連結原始 crop、overview、resize 尺寸、`image_grid_thw`、來源 regions、去重資訊與 image vector row；同時保存 resume checkpoint。
+
+`records.jsonl` 的主要欄位：
+
+```json
+{
+  "id": "deterministic-record-id",
+  "embedding_text": "[type=table]\n[section=...]\n...",
+  "plain_text": "...",
+  "raw_html": "...",
+  "metadata": {
+    "scope": "page",
+    "route": "text_vector",
+    "region_ids": ["surya-p4-r12"],
+    "types": ["table"],
+    "page_index": 4,
+    "heading_path": ["..."]
+  },
+  "vector_ref": {
+    "kind": "text_vector",
+    "row": 12
+  }
+}
+```
+
+`vector_ref.kind` 決定要讀取哪個 `.npy`，`vector_ref.row` 是該矩陣的列索引；provenance-only record 的 `vector_ref` 為 `null`。Image record 另有 `metadata.source_image_id` 與 `metadata.image_metadata_ref`，可在 `embedding_inputs/metadata.json` 找到對應 crop。
+
+最小讀取範例：
+
+```python
+import json
+from pathlib import Path
+
+import numpy as np
+
+kb = Path("output/MMDDHHmm_qwen3vl/knowledge_base")
+records = [json.loads(line) for line in (kb / "records.jsonl").read_text().splitlines()]
+text_vectors = np.load(kb / "vectors/text.npy", mmap_mode="r")
+image_vectors = np.load(kb / "vectors/image.npy", mmap_mode="r")
+image_metadata = json.loads((kb / "embedding_inputs/metadata.json").read_text())
+images_by_id = {item["source_image_id"]: item for item in image_metadata["items"]}
+
+record = next(item for item in records if item["vector_ref"] is not None)
+ref = record["vector_ref"]
+matrix = text_vectors if ref["kind"] == "text_vector" else image_vectors
+vector = matrix[ref["row"]]
+
+if ref["kind"] == "image_vector":
+    image = images_by_id[record["metadata"]["source_image_id"]]
+    crop_path = kb / image["source_crop"]["path"]
+```
+
+本 pipeline 目前只建立知識庫，尚未包含 query embedding、Top-K retrieval、reranker、vector DB、API 或前端。
+
+模型與 runtime 預設值位於 `config/embedding.yml`；`config/local.yml` 會自動覆寫，單次執行的 `--config` 優先序最高。`HF_TOKEN`、`HF_HOME` 等秘密或主機值應由 shell／deployment environment 注入。
+
+`config/local.example.yml` 中的 `embedding.image_worker.max_images_per_process` 是預留的 worker recycling 設定，目前程式尚未讀取；現階段仍需使用 `--resume-from` 啟動新的 process。
 
 ## Output naming
 
