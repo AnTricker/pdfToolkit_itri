@@ -1,0 +1,17 @@
+# Copy this file to config/local.yml for host-specific overrides.
+# config/local.yml is ignored by Git and loaded after the shipped defaults.
+embedding:
+  modes:
+    qwen3vl:
+      runtime:
+        device: cuda
+        dtype: float16
+        attention: sdpa
+        batch_size: 1
+
+embedding_preprocess:
+  image_preprocess:
+    factor: 32
+    patch_size: 16
+    min_pixels: 4096
+    max_pixels: 1310720

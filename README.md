@@ -164,10 +164,23 @@ output/MMDDHHmm_qwen3vl/knowledge_base/
 ├─ vectors/
 │  ├─ text.npy
 │  └─ image.npy
-└─ crops/
+├─ crops/                         # 去重後的原始代表 crop
+└─ embedding_inputs/
+   ├─ metadata.json               # 原圖、resize、model grid 與 vector row 對應
+   └─ <region-id>-overview.png    # 實際送入 image embedding 的圖片
 ```
 
 模型與 runtime 設定在 `config/embedding.yml`，可由 `config/local.yml` 或 `--config` 覆寫。`HF_TOKEN`、`HF_HOME` 等主機值由 shell／deployment environment 注入，不寫入 YAML。
+
+建立主機專用設定時，先複製範例再修改；`config/local.yml` 已被 Git 忽略，且會自動覆寫上述預設值：
+
+```bash
+cp config/local.example.yml config/local.yml
+```
+
+若只想覆寫單次執行，可另外建立 YAML 並使用 `--config path/to/override.yml`；其優先序高於 `config/local.yml`。
+
+圖片會逐張建立 checkpoint。若 image embedding 中途失敗，不會發布正式 knowledge base；已建立的 crop、實際模型輸入、metadata 與 vectors 會保留於同一 run 的 `knowledge_base.failed/` 供診斷，但後續執行不會自動復用。
 
 ## Output naming
 

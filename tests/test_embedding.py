@@ -29,9 +29,19 @@ class FakeEmbedder:
     def encode_texts(self, values: list[str]) -> np.ndarray:
         return np.asarray([[float(len(value)), 1.0, 0.0] for value in values], dtype=np.float32)
 
-    def encode_images(self, values: list[Path]) -> np.ndarray:
-        assert all(path.is_file() for path in values)
-        return np.asarray([[0.0, 1.0, 1.0] for _ in values], dtype=np.float32)
+    def encode_image(self, value: Path) -> np.ndarray:
+        assert value.is_file()
+        return np.asarray([[0.0, 1.0, 1.0]], dtype=np.float32)
+
+    def inspect_image(self, value: Path) -> dict:
+        with Image.open(value) as image:
+            width, height = image.size
+        return {
+            "image_grid_thw": [1, height // 16, width // 16],
+            "patch_size": 16,
+            "effective_width": width,
+            "effective_height": height,
+        }
 
     def split_text(self, value: str) -> list[str]:
         return [value]
@@ -60,7 +70,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path]:
     Image.new("RGB", (4, 4), "white").save(crops / "text.png")
     Image.new("RGB", (4, 4), "black").save(crops / "table.png")
     Image.new("RGB", (4, 4), "blue").save(crops / "image.png")
-    Image.new("RGB", (8, 4), "red").save(crops / "skipped.png")
+    Image.new("RGBA", (8, 4), (255, 0, 0, 128)).save(crops / "skipped.png")
     payload = {
         "tool": "surya",
         "regions": {
@@ -85,6 +95,12 @@ def _config() -> dict:
         "embedding_preprocess": {
             "text_when_nonempty": True,
             "image_when_text_empty": True,
+            "image_preprocess": {
+                "factor": 32,
+                "patch_size": 16,
+                "min_pixels": 4096,
+                "max_pixels": 1310720,
+            },
             "persist_headings_across_pages": True,
             "aggregate_repeated_regions": True,
             "independent_text_types": ["table", "form"],
@@ -144,6 +160,31 @@ def test_routing_dedup_heading_and_vector_rows(tmp_path: Path) -> None:
     assert sorted(path.name for path in (result / "crops").iterdir()) == [
         "image-0.png", "skipped-0.png",
     ]
+    assert sorted(path.name for path in (result / "embedding_inputs").glob("*.png")) == [
+        "image-0-overview.png", "skipped-0-overview.png",
+    ]
+    image_metadata = json.loads(
+        (result / "embedding_inputs" / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert image_metadata["status"] == "completed"
+    assert len(image_metadata["items"]) == 2
+    assert all(len(item["embedding_inputs"]) == 1 for item in image_metadata["items"])
+    assert all(
+        item["embedding_inputs"][0]["kind"] == "overview"
+        for item in image_metadata["items"]
+    )
+    skipped_item = next(
+        item for item in image_metadata["items"]
+        if item["source_image_id"] == "skipped-0"
+    )
+    skipped_input = skipped_item["embedding_inputs"][0]
+    assert skipped_item["source_crop"]["mode"] == "RGBA"
+    assert skipped_input["mode"] == "RGB"
+    assert skipped_input["width"] % 32 == 0
+    assert skipped_input["height"] % 32 == 0
+    assert skipped_input["model_input"]["effective_width"] == skipped_input["width"]
+    assert skipped_input["model_input"]["effective_height"] == skipped_input["height"]
+    assert skipped_input["path"] in manifest["files"]
     assert all(record["metadata"]["heading_path"] == ["1. Safety"] for record in output_records if record["metadata"]["scope"] == "page")
     table = next(record for record in output_records if record["metadata"]["types"] == ["table"])
     assert table["vector_ref"]["kind"] == "text_vector"
@@ -154,6 +195,7 @@ def test_routing_dedup_heading_and_vector_rows(tmp_path: Path) -> None:
     skipped = next(record for record in output_records if "skipped-0" in record["metadata"]["region_ids"])
     assert skipped["vector_ref"]["kind"] == "image_vector"
     assert skipped["metadata"]["skipped"] is True
+    assert skipped["metadata"]["source_image_id"] == "skipped-0"
 
 
 def test_three_page_visual_dedup_preserves_sources_and_one_crop(tmp_path: Path) -> None:
@@ -192,18 +234,23 @@ def test_three_page_visual_dedup_preserves_sources_and_one_crop(tmp_path: Path) 
     assert record["metadata"]["scope"] == "document_root"
     assert record["metadata"]["region_ids"] == ["logo-0", "logo-1", "logo-2"]
     assert record["metadata"]["page_indexes"] == [0, 1, 2]
-    assert record["metadata"]["representative_region_id"] == "logo-0"
-    assert record["metadata"]["visual_dedup"]["cluster_size"] == 3
-    assert record["metadata"]["visual_dedup"]["distinct_page_count"] == 3
-    assert [item["hamming_distance_to_representative"] for item in record["metadata"]["source_regions"]] == [0, 0, 0]
-    assert all(item["skipped"] is True for item in record["metadata"]["source_regions"])
+    assert record["metadata"]["source_image_id"] == "logo-0"
+    metadata = json.loads(
+        (result / "embedding_inputs" / "metadata.json").read_text(encoding="utf-8")
+    )
+    image_item = metadata["items"][0]
+    assert image_item["source_image_id"] == "logo-0"
+    assert image_item["deduplication"]["visual_dedup"]["cluster_size"] == 3
+    assert image_item["deduplication"]["visual_dedup"]["distinct_page_count"] == 3
+    assert [item["hamming_distance_to_representative"] for item in image_item["source_regions"]] == [0, 0, 0]
+    assert all(item["skipped"] is True for item in image_item["source_regions"])
     assert all(
         {
             "region_id", "page_index", "reading_order", "type", "raw_label",
             "confidence", "skipped", "error", "crop", "source_provenance",
             "phash", "hamming_distance_to_representative",
         } <= item.keys()
-        for item in record["metadata"]["source_regions"]
+        for item in image_item["source_regions"]
     )
     assert [path.name for path in (result / "crops").iterdir()] == ["logo-0.png"]
     assert np.load(result / "vectors" / "image.npy").shape == (1, 3)
@@ -311,15 +358,59 @@ def test_numeric_batch_discovery_and_config_override(tmp_path: Path) -> None:
     assert config["embedding"]["modes"]["qwen3vl"]["runtime"]["batch_size"] == 2
     assert config["embedding"]["modes"]["qwen3vl"]["model_id"] == "Qwen/Qwen3-VL-Embedding-8B"
 
+    local_copy = tmp_path / "local.yml"
+    example = (project_root / "config" / "local.example.yml").read_text(encoding="utf-8")
+    local_copy.write_text(example.replace("max_pixels: 1310720", "max_pixels: 262144"), encoding="utf-8")
+    local_config = load_config(project_root, local_copy)
+    assert local_config["embedding_preprocess"]["image_preprocess"]["max_pixels"] == 262144
+
 
 def test_embedding_failure_does_not_publish_manifest(tmp_path: Path) -> None:
     run, _ = _fixture(tmp_path)
 
     class BrokenEmbedder(FakeEmbedder):
-        def encode_texts(self, values: list[str]) -> np.ndarray:
-            raise RuntimeError("expected test failure")
+        calls = 0
+
+        def encode_image(self, value: Path) -> np.ndarray:
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("expected test failure")
+            return super().encode_image(value)
 
     output = tmp_path / "failed"
     with pytest.raises(RuntimeError, match="expected test failure"):
         build_knowledge_base(run, output, _config(), BrokenEmbedder())
     assert not (output / "knowledge_base" / "manifest.json").exists()
+    failed = output / "knowledge_base.failed"
+    metadata = json.loads(
+        (failed / "embedding_inputs" / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert metadata["status"] == "failed"
+    assert metadata["items"][0]["embedding_inputs"][0]["status"] == "succeeded"
+    assert metadata["items"][1]["embedding_inputs"][0]["status"] == "failed"
+    assert metadata["items"][1]["embedding_inputs"][0]["error"] == {
+        "type": "RuntimeError",
+        "message": "expected test failure",
+    }
+    assert np.load(failed / "vectors" / "image.npy").shape == (1, 3)
+
+
+def test_processor_size_mismatch_is_preserved_as_failed_diagnostic(tmp_path: Path) -> None:
+    run, _ = _fixture(tmp_path)
+
+    class ResizingEmbedder(FakeEmbedder):
+        def inspect_image(self, value: Path) -> dict:
+            result = super().inspect_image(value)
+            result["effective_width"] += 16
+            return result
+
+    output = tmp_path / "mismatch"
+    with pytest.raises(ValueError, match="Processor resized"):
+        build_knowledge_base(run, output, _config(), ResizingEmbedder())
+    metadata = json.loads(
+        (output / "knowledge_base.failed" / "embedding_inputs" / "metadata.json").read_text(
+            encoding="utf-8",
+        )
+    )
+    failed_input = metadata["items"][0]["embedding_inputs"][0]
+    assert failed_input["model_input"]["effective_width"] != failed_input["width"]

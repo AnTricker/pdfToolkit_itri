@@ -295,6 +295,7 @@ def run_qwen3vl(toolkit_root: Path, input_path: Path, custom_config: Path | None
         required = (
             Path("knowledge_base/manifest.json"),
             Path("knowledge_base/records.jsonl"),
+            Path("knowledge_base/embedding_inputs/metadata.json"),
             Path("knowledge_base/vectors/text.npy"),
             Path("knowledge_base/vectors/image.npy"),
         )

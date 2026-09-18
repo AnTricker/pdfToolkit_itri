@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 import re
 import shutil
 from collections import defaultdict
@@ -14,7 +15,7 @@ from .io import read_json, sha256_file, stable_hash, write_json
 from .sorting import natural_key
 
 
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 HEADER_TYPES = {"pageheader", "page-header", "header"}
 FOOTER_TYPES = {"pagefooter", "page-footer", "footer"}
 HEADING_TYPES = {"sectionheader", "section-header", "heading", "title"}
@@ -29,7 +30,9 @@ class Embedder(Protocol):
 
     def encode_texts(self, values: list[str]) -> Any: ...
 
-    def encode_images(self, values: list[Path]) -> Any: ...
+    def encode_image(self, value: Path) -> Any: ...
+
+    def inspect_image(self, value: Path) -> dict[str, Any]: ...
 
     def split_text(self, value: str) -> list[str]: ...
 
@@ -295,6 +298,80 @@ def _copy_crop_as_png(source: Path, destination: Path) -> None:
     from PIL import Image
     with Image.open(source) as image:
         image.save(destination, format="PNG")
+
+
+def _image_details(path: Path) -> dict[str, Any]:
+    from PIL import Image
+    with Image.open(path) as image:
+        width, height = image.size
+        return {
+            "width": width,
+            "height": height,
+            "pixel_count": width * height,
+            "mode": image.mode,
+            "format": image.format,
+        }
+
+
+def _smart_resize(width: int, height: int, settings: dict[str, Any]) -> tuple[int, int]:
+    factor = int(settings["factor"])
+    min_pixels = int(settings["min_pixels"])
+    max_pixels = int(settings["max_pixels"])
+    if factor <= 0 or min_pixels <= 0 or max_pixels < min_pixels:
+        raise ValueError("image_preprocess requires factor > 0 and max_pixels >= min_pixels > 0")
+    if width <= 0 or height <= 0:
+        raise ValueError("Image dimensions must be positive")
+
+    resized_width = max(factor, round(width / factor) * factor)
+    resized_height = max(factor, round(height / factor) * factor)
+    if resized_width * resized_height > max_pixels:
+        scale = math.sqrt((width * height) / max_pixels)
+        resized_width = max(factor, math.floor(width / scale / factor) * factor)
+        resized_height = max(factor, math.floor(height / scale / factor) * factor)
+    elif resized_width * resized_height < min_pixels:
+        scale = math.sqrt(min_pixels / (width * height))
+        resized_width = max(factor, math.ceil(width * scale / factor) * factor)
+        resized_height = max(factor, math.ceil(height * scale / factor) * factor)
+    return resized_width, resized_height
+
+
+def _materialize_embedding_input(
+    source: Path, destination: Path, settings: dict[str, Any],
+) -> dict[str, Any]:
+    from PIL import Image, ImageOps
+    with Image.open(source) as opened:
+        image = ImageOps.exif_transpose(opened)
+        source_width, source_height = image.size
+        if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+            rgba = image.convert("RGBA")
+            background = Image.new("RGBA", rgba.size, "white")
+            image = Image.alpha_composite(background, rgba).convert("RGB")
+        else:
+            image = image.convert("RGB")
+        width, height = _smart_resize(source_width, source_height, settings)
+        image = image.resize((width, height), Image.Resampling.BICUBIC)
+        image.save(destination, format="PNG")
+    return {
+        "width": width,
+        "height": height,
+        "pixel_count": width * height,
+        "mode": "RGB",
+        "format": "PNG",
+    }
+
+
+def _image_preprocess_settings(preprocess: dict[str, Any]) -> dict[str, Any]:
+    settings = {
+        "factor": 32,
+        "patch_size": 16,
+        "min_pixels": 4096,
+        "max_pixels": 1310720,
+    }
+    settings.update(preprocess.get("image_preprocess") or {})
+    _smart_resize(1, 1, settings)
+    if int(settings["patch_size"]) <= 0:
+        raise ValueError("image_preprocess.patch_size must be positive")
+    return settings
 
 
 def _base_metadata(
@@ -643,45 +720,158 @@ def build_knowledge_base(
         raise RuntimeError("Embedding output requires numpy") from exc
 
     indexes = discover_surya_indexes(input_path)
-    records, warnings, visual_stats = prepare_records(indexes, config.get("embedding_preprocess", {}))
+    preprocess = config.get("embedding_preprocess", {})
+    image_preprocess = _image_preprocess_settings(preprocess)
+    records, warnings, visual_stats = prepare_records(indexes, preprocess)
     records = _split_long_text_records(records, embedder)
     text_records = [record for record in records if record["metadata"].get("route") == "text_vector"]
     image_records = [record for record in records if record["metadata"].get("route") == "image_vector"]
 
     text_values = [record["embedding_text"] for record in text_records]
-    image_values = [Path(record["_image_source"]) for record in image_records]
     vector_dtype = np.dtype(embedder.dtype)
-    text_matrix = _as_matrix(embedder.encode_texts(text_values), len(text_values), embedder.dimension, "text") if text_values else np.empty((0, embedder.dimension), dtype=vector_dtype)
-    image_matrix = _as_matrix(embedder.encode_images(image_values), len(image_values), embedder.dimension, "image") if image_values else np.empty((0, embedder.dimension), dtype=vector_dtype)
-    text_matrix = _finalize_matrix(text_matrix, embedder.dtype, embedder.normalize_embeddings, "text")
-    image_matrix = _finalize_matrix(image_matrix, embedder.dtype, embedder.normalize_embeddings, "image")
-
-    for row, record in enumerate(text_records):
-        record["vector_ref"] = {"kind": "text_vector", "row": row}
-    for row, record in enumerate(image_records):
-        record["vector_ref"] = {"kind": "image_vector", "row": row}
-
     target = output_dir / "knowledge_base"
     temporary = output_dir / ".knowledge_base.tmp"
+    failed = output_dir / "knowledge_base.failed"
     if target.exists():
         raise FileExistsError(target)
+    if failed.exists():
+        raise FileExistsError(failed)
     if temporary.exists():
         shutil.rmtree(temporary)
     (temporary / "vectors").mkdir(parents=True)
     (temporary / "crops").mkdir()
+    (temporary / "embedding_inputs").mkdir()
+    image_metadata: dict[str, Any] = {
+        "schema_version": "1.0",
+        "status": "building",
+        "image_preprocessing": {
+            **image_preprocess,
+            "maintain_aspect_ratio": True,
+            "convert_rgb": True,
+            "exif_transpose": True,
+            "resample": "bicubic",
+        },
+        "items": [],
+    }
+    metadata_path = temporary / "embedding_inputs" / "metadata.json"
+    current_input: dict[str, Any] | None = None
     try:
+        text_matrix = (
+            _as_matrix(
+                embedder.encode_texts(text_values), len(text_values), embedder.dimension, "text",
+            )
+            if text_values
+            else np.empty((0, embedder.dimension), dtype=vector_dtype)
+        )
+        text_matrix = _finalize_matrix(
+            text_matrix, embedder.dtype, embedder.normalize_embeddings, "text",
+        )
+        image_matrix = np.empty((0, embedder.dimension), dtype=vector_dtype)
+        for row, record in enumerate(text_records):
+            record["vector_ref"] = {"kind": "text_vector", "row": row}
         np.save(temporary / "vectors" / "text.npy", text_matrix)
         np.save(temporary / "vectors" / "image.npy", image_matrix)
-        for record in image_records:
-            source = Path(record.pop("_image_source"))
-            region_id = record["metadata"].get(
+        write_json(metadata_path, image_metadata)
+
+        for image_index, record in enumerate(image_records):
+            source = Path(record["_image_source"])
+            source_image_id = record["metadata"].get(
                 "representative_region_id", record["metadata"]["region_ids"][0],
             )
-            if Path(region_id).name != region_id:
-                raise ValueError(f"Unsafe Surya region ID for crop filename: {region_id}")
-            destination = temporary / "crops" / f"{region_id}.png"
-            _copy_crop_as_png(source, destination)
-            record["metadata"]["crop"] = destination.relative_to(temporary).as_posix()
+            if Path(source_image_id).name != source_image_id:
+                raise ValueError(f"Unsafe Surya region ID for image filename: {source_image_id}")
+
+            crop_path = temporary / "crops" / f"{source_image_id}.png"
+            input_path = temporary / "embedding_inputs" / f"{source_image_id}-overview.png"
+            current_input = {
+                "kind": "overview",
+                "path": input_path.relative_to(temporary).as_posix(),
+                "width": None,
+                "height": None,
+                "pixel_count": None,
+                "mode": None,
+                "format": "PNG",
+                "sha256": None,
+                "embedding_index": image_index,
+                "model_input": None,
+                "vector_ref": None,
+                "status": "pending",
+                "error": None,
+            }
+            item = {
+                "source_image_id": source_image_id,
+                "source_crop": {
+                    "path": crop_path.relative_to(temporary).as_posix(),
+                    "original_path": str(source),
+                    "width": None,
+                    "height": None,
+                    "pixel_count": None,
+                    "mode": None,
+                    "format": None,
+                    "sha256": None,
+                },
+                "source_regions": record["metadata"].pop("source_regions", []),
+                "deduplication": {
+                    "representative_selection": record["metadata"].pop(
+                        "representative_selection", None,
+                    ),
+                    "visual_dedup": record["metadata"].pop("visual_dedup", None),
+                    "raw_labels": record["metadata"].pop("raw_labels", []),
+                },
+                "embedding_inputs": [current_input],
+            }
+            image_metadata["items"].append(item)
+            record["metadata"].pop("representative_region_id", None)
+            record["metadata"]["source_image_id"] = source_image_id
+            record["metadata"]["image_metadata_ref"] = (
+                f"embedding_inputs/metadata.json#{source_image_id}"
+            )
+            write_json(metadata_path, image_metadata)
+
+            try:
+                _copy_crop_as_png(source, crop_path)
+                item["source_crop"].update(_image_details(crop_path))
+                item["source_crop"]["sha256"] = sha256_file(crop_path)
+                input_details = _materialize_embedding_input(
+                    source, input_path, image_preprocess,
+                )
+                current_input.update(input_details)
+                current_input["sha256"] = sha256_file(input_path)
+                write_json(metadata_path, image_metadata)
+                model_input = embedder.inspect_image(input_path)
+                expected_size = (input_details["width"], input_details["height"])
+                effective_size = (
+                    int(model_input["effective_width"]),
+                    int(model_input["effective_height"]),
+                )
+                current_input["model_input"] = model_input
+                if effective_size != expected_size:
+                    raise ValueError(
+                        f"Processor resized {source_image_id} from {expected_size} "
+                        f"to {effective_size}"
+                    )
+                row_matrix = _as_matrix(
+                    embedder.encode_image(input_path), 1, embedder.dimension, "image",
+                )
+                row_matrix = _finalize_matrix(
+                    row_matrix, embedder.dtype, embedder.normalize_embeddings, "image",
+                )
+                vector_row = image_matrix.shape[0]
+                image_matrix = np.concatenate((image_matrix, row_matrix), axis=0)
+                record["vector_ref"] = {"kind": "image_vector", "row": vector_row}
+                current_input["vector_ref"] = record["vector_ref"]
+                current_input["status"] = "succeeded"
+                np.save(temporary / "vectors" / "image.npy", image_matrix)
+                write_json(metadata_path, image_metadata)
+            except BaseException as exc:
+                current_input["status"] = "failed"
+                current_input["error"] = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                write_json(metadata_path, image_metadata)
+                raise
+
         for record in records:
             record.pop("_image_source", None)
             record.pop("_embedding_body", None)
@@ -691,13 +881,16 @@ def build_knowledge_base(
             for record in records:
                 handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
+        image_metadata["status"] = "completed"
+        write_json(metadata_path, image_metadata)
         file_hashes = {
             "records.jsonl": sha256_file(records_path),
             "vectors/text.npy": sha256_file(temporary / "vectors" / "text.npy"),
             "vectors/image.npy": sha256_file(temporary / "vectors" / "image.npy"),
         }
-        for crop in sorted((temporary / "crops").iterdir()):
-            file_hashes[crop.relative_to(temporary).as_posix()] = sha256_file(crop)
+        for directory in (temporary / "crops", temporary / "embedding_inputs"):
+            for artifact in sorted(path for path in directory.rglob("*") if path.is_file()):
+                file_hashes[artifact.relative_to(temporary).as_posix()] = sha256_file(artifact)
         manifest = {
             "schema_version": SCHEMA_VERSION,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -722,13 +915,23 @@ def build_knowledge_base(
                 "warnings": len(warnings),
                 **visual_stats,
             },
+            "image_preprocessing": image_metadata["image_preprocessing"],
             "warnings": warnings,
             "files": file_hashes,
         }
         write_json(temporary / "manifest.json", manifest)
         temporary.replace(target)
-    except BaseException:
+    except BaseException as exc:
         if temporary.exists():
-            shutil.rmtree(temporary)
+            image_metadata["status"] = "failed"
+            image_metadata["failure"] = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+            if current_input is not None and current_input["status"] == "pending":
+                current_input["status"] = "failed"
+                current_input["error"] = image_metadata["failure"]
+            write_json(metadata_path, image_metadata)
+            temporary.replace(failed)
         raise
     return target

@@ -26,6 +26,11 @@ embedding:
 embedding_preprocess:
   text_when_nonempty: true
   image_when_text_empty: true
+  image_preprocess:
+    factor: 32
+    patch_size: 16
+    min_pixels: 4096
+    max_pixels: 1310720
   persist_headings_across_pages: true
   aggregate_repeated_regions: true
   independent_text_types: [table, form]

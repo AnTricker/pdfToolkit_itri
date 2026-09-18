@@ -10,7 +10,7 @@ from .embedding import build_knowledge_base
 
 
 class SentenceTransformerEmbedder:
-    def __init__(self, settings: dict[str, Any]) -> None:
+    def __init__(self, settings: dict[str, Any], preprocess: dict[str, Any]) -> None:
         try:
             import torch
             from sentence_transformers import SentenceTransformer
@@ -24,6 +24,10 @@ class SentenceTransformerEmbedder:
         self.dtype = str(runtime.get("dtype", "float16"))
         self.normalize_embeddings = bool(runtime.get("normalize_embeddings", True))
         self.batch_size = int(runtime.get("batch_size", 1))
+        image_preprocess = preprocess.get("image_preprocess") or {}
+        self.image_patch_size = int(image_preprocess.get("patch_size", 16))
+        self.image_min_pixels = int(image_preprocess.get("min_pixels", 4096))
+        self.image_max_pixels = int(image_preprocess.get("max_pixels", 1310720))
         dtype = getattr(torch, self.dtype, None)
         if dtype is None:
             raise ValueError(f"Unsupported torch dtype: {self.dtype}")
@@ -39,6 +43,7 @@ class SentenceTransformerEmbedder:
             model_kwargs=model_kwargs,
             token=token,
         )
+        self._configure_image_processor()
         configured_max = runtime.get("max_tokens")
         model_max = getattr(self.model, "max_seq_length", None)
         if configured_max is None and model_max is None:
@@ -60,8 +65,54 @@ class SentenceTransformerEmbedder:
     def encode_texts(self, values: list[str]) -> Any:
         return self._encode(values)
 
-    def encode_images(self, values: list[Path]) -> Any:
-        return self._encode([{"image": str(path)} for path in values])
+    def encode_image(self, value: Path) -> Any:
+        return self._encode([{"image": str(value)}])
+
+    def _image_processor(self) -> Any:
+        candidates = [self.model]
+        first_module = getattr(self.model, "_first_module", None)
+        if callable(first_module):
+            candidates.append(first_module())
+        candidates.extend(getattr(self.model, "_modules", {}).values())
+        for candidate in candidates:
+            processor = getattr(candidate, "processor", None)
+            image_processor = getattr(processor, "image_processor", None)
+            if image_processor is not None:
+                return image_processor
+        raise RuntimeError("SentenceTransformer model does not expose its image processor")
+
+    def _configure_image_processor(self) -> None:
+        image_processor = self._image_processor()
+        if hasattr(image_processor, "min_pixels"):
+            image_processor.min_pixels = self.image_min_pixels
+        if hasattr(image_processor, "max_pixels"):
+            image_processor.max_pixels = self.image_max_pixels
+        if hasattr(image_processor, "size"):
+            image_processor.size = {
+                "shortest_edge": self.image_min_pixels,
+                "longest_edge": self.image_max_pixels,
+            }
+
+    def inspect_image(self, value: Path) -> dict[str, Any]:
+        features = self.model.tokenize([{"image": str(value)}])
+        grid = features.get("image_grid_thw")
+        if grid is None:
+            raise RuntimeError("Qwen3-VL processor did not return image_grid_thw")
+        if hasattr(grid, "detach"):
+            grid = grid.detach().cpu().tolist()
+        elif hasattr(grid, "tolist"):
+            grid = grid.tolist()
+        if isinstance(grid, list) and grid and isinstance(grid[0], list):
+            grid = grid[0]
+        if not isinstance(grid, list) or len(grid) != 3:
+            raise ValueError(f"Unexpected image_grid_thw: {grid!r}")
+        temporal, grid_height, grid_width = (int(part) for part in grid)
+        return {
+            "image_grid_thw": [temporal, grid_height, grid_width],
+            "patch_size": self.image_patch_size,
+            "effective_width": grid_width * self.image_patch_size,
+            "effective_height": grid_height * self.image_patch_size,
+        }
 
     def split_text(self, value: str) -> list[str]:
         tokenizer = getattr(self.model, "tokenizer", None)
@@ -102,7 +153,9 @@ def main(argv: list[str] | None = None) -> int:
     settings = embedding["modes"][mode]
     if settings.get("provider") != "sentence_transformers":
         raise ValueError(f"Unsupported embedding provider: {settings.get('provider')}")
-    embedder = SentenceTransformerEmbedder(settings)
+    embedder = SentenceTransformerEmbedder(
+        settings, config.get("embedding_preprocess", {}),
+    )
     build_knowledge_base(args.input, args.output_dir, config, embedder)
     return 0
 
