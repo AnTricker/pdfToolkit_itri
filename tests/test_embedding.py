@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -26,6 +27,9 @@ class FakeEmbedder:
     dtype = "float32"
     normalize_embeddings = True
 
+    def __init__(self) -> None:
+        self.synchronize_calls = 0
+
     def encode_texts(self, values: list[str]) -> np.ndarray:
         return np.asarray([[float(len(value)), 1.0, 0.0] for value in values], dtype=np.float32)
 
@@ -42,6 +46,9 @@ class FakeEmbedder:
             "effective_width": width,
             "effective_height": height,
         }
+
+    def synchronize(self) -> None:
+        self.synchronize_calls += 1
 
     def split_text(self, value: str) -> list[str]:
         return [value]
@@ -393,6 +400,113 @@ def test_embedding_failure_does_not_publish_manifest(tmp_path: Path) -> None:
         "message": "expected test failure",
     }
     assert np.load(failed / "vectors" / "image.npy").shape == (1, 3)
+
+
+def test_failed_knowledge_base_resumes_without_reembedding_completed_images(
+    tmp_path: Path,
+) -> None:
+    run, _ = _fixture(tmp_path)
+
+    class BrokenEmbedder(FakeEmbedder):
+        def __init__(self) -> None:
+            super().__init__()
+            self.image_calls = 0
+
+        def encode_image(self, value: Path) -> np.ndarray:
+            self.image_calls += 1
+            if self.image_calls == 2:
+                raise RuntimeError("interrupt image embedding")
+            return super().encode_image(value)
+
+    output = tmp_path / "resume"
+    first = BrokenEmbedder()
+    with pytest.raises(RuntimeError, match="interrupt image embedding"):
+        build_knowledge_base(run, output, _config(), first)
+    failed = output / "knowledge_base.failed"
+    metadata_before = json.loads(
+        (failed / "embedding_inputs" / "metadata.json").read_text(encoding="utf-8")
+    )
+    first_input = failed / metadata_before["items"][0]["embedding_inputs"][0]["path"]
+    first_input_hash = metadata_before["items"][0]["embedding_inputs"][0]["sha256"]
+
+    resumed = FakeEmbedder()
+    result = build_knowledge_base(run, output, _config(), resumed, resume=True)
+
+    assert result == output / "knowledge_base"
+    assert resumed.synchronize_calls == 1
+    assert not failed.exists()
+    assert np.load(result / "vectors" / "image.npy").shape == (2, 3)
+    assert first_input_hash == json.loads(
+        (result / "embedding_inputs" / "metadata.json").read_text(encoding="utf-8")
+    )["items"][0]["embedding_inputs"][0]["sha256"]
+    assert first_input_hash == hashlib.sha256(
+        (result / first_input.relative_to(failed)).read_bytes()
+    ).hexdigest()
+
+
+def test_resume_rejects_changed_source_and_preserves_failed_folder(tmp_path: Path) -> None:
+    run, index = _fixture(tmp_path)
+
+    class BrokenEmbedder(FakeEmbedder):
+        def encode_image(self, value: Path) -> np.ndarray:
+            raise RuntimeError("stop after checkpoint")
+
+    output = tmp_path / "changed"
+    with pytest.raises(RuntimeError, match="stop after checkpoint"):
+        build_knowledge_base(run, output, _config(), BrokenEmbedder())
+    payload = json.loads(index.read_text(encoding="utf-8"))
+    payload["regions"]["body-0"]["text"] = "changed source"
+    index.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="checkpoint does not match"):
+        build_knowledge_base(run, output, _config(), FakeEmbedder(), resume=True)
+    assert (output / "knowledge_base.failed").is_dir()
+
+
+def test_resume_failure_updates_checkpoint_for_another_resume(tmp_path: Path) -> None:
+    run, _ = _fixture(tmp_path)
+
+    class AlwaysBroken(FakeEmbedder):
+        def encode_image(self, value: Path) -> np.ndarray:
+            raise RuntimeError("still broken")
+
+    output = tmp_path / "retry"
+    with pytest.raises(RuntimeError, match="still broken"):
+        build_knowledge_base(run, output, _config(), AlwaysBroken())
+    with pytest.raises(RuntimeError, match="still broken"):
+        build_knowledge_base(run, output, _config(), AlwaysBroken(), resume=True)
+
+    failed = output / "knowledge_base.failed"
+    metadata = json.loads(
+        (failed / "embedding_inputs" / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert metadata["status"] == "failed"
+    assert metadata["items"][0]["embedding_inputs"][0]["status"] == "failed"
+
+
+def test_legacy_failed_folder_without_checkpoint_can_resume(tmp_path: Path) -> None:
+    run, _ = _fixture(tmp_path)
+
+    class BrokenEmbedder(FakeEmbedder):
+        def encode_image(self, value: Path) -> np.ndarray:
+            raise RuntimeError("legacy failure")
+
+    output = tmp_path / "legacy"
+    with pytest.raises(RuntimeError, match="legacy failure"):
+        build_knowledge_base(run, output, _config(), BrokenEmbedder())
+    metadata_path = output / "knowledge_base.failed" / "embedding_inputs" / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("checkpoint")
+    metadata["schema_version"] = "1.0"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    result = build_knowledge_base(run, output, _config(), FakeEmbedder(), resume=True)
+
+    upgraded = json.loads(
+        (result / "embedding_inputs" / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert upgraded["schema_version"] == "1.1"
+    assert "checkpoint" in upgraded
 
 
 def test_processor_size_mismatch_is_preserved_as_failed_diagnostic(tmp_path: Path) -> None:

@@ -3,8 +3,10 @@ from __future__ import annotations
 import html
 import json
 import math
+import os
 import re
 import shutil
+import tempfile
 from collections import defaultdict
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -35,6 +37,8 @@ class Embedder(Protocol):
     def inspect_image(self, value: Path) -> dict[str, Any]: ...
 
     def split_text(self, value: str) -> list[str]: ...
+
+    def synchronize(self) -> None: ...
 
 
 def discover_surya_indexes(input_path: Path) -> list[Path]:
@@ -708,11 +712,224 @@ def _split_long_text_records(records: list[dict[str, Any]], embedder: Embedder) 
     return output
 
 
+def _save_matrix(path: Path, matrix: Any) -> None:
+    """Atomically replace a NumPy checkpoint."""
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".npy", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            import numpy as np
+
+            np.save(handle, matrix)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _model_checkpoint(embedder: Embedder) -> dict[str, Any]:
+    return {
+        "model_id": embedder.model_id,
+        "revision": embedder.revision,
+        "dimension": embedder.dimension,
+        "dtype": embedder.dtype,
+        "normalize_embeddings": embedder.normalize_embeddings,
+    }
+
+
+def _checkpoint_payload(
+    indexes: list[Path],
+    text_records: list[dict[str, Any]],
+    image_records: list[dict[str, Any]],
+    image_preprocessing: dict[str, Any],
+    embedder: Embedder,
+) -> dict[str, Any]:
+    return {
+        "sources": [
+            {"index": str(path), "sha256": sha256_file(path)}
+            for path in indexes
+        ],
+        "model": _model_checkpoint(embedder),
+        "image_preprocessing": image_preprocessing,
+        "text_record_ids": [record["id"] for record in text_records],
+        "image_record_ids": [record["id"] for record in image_records],
+    }
+
+
+def _source_image_id(record: dict[str, Any]) -> str:
+    value = record["metadata"].get(
+        "source_image_id",
+        record["metadata"].get(
+            "representative_region_id", record["metadata"]["region_ids"][0],
+        ),
+    )
+    if Path(value).name != value:
+        raise ValueError(f"Unsafe Surya region ID for image filename: {value}")
+    return value
+
+
+def _expected_image_metadata(record: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
+    metadata = record["metadata"]
+    return deepcopy(metadata.get("source_regions", [])), {
+        "representative_selection": deepcopy(metadata.get("representative_selection")),
+        "visual_dedup": deepcopy(metadata.get("visual_dedup")),
+        "raw_labels": deepcopy(metadata.get("raw_labels", [])),
+    }
+
+
+def _bind_image_record(record: dict[str, Any], source_image_id: str) -> None:
+    record["metadata"].pop("source_regions", None)
+    record["metadata"].pop("representative_selection", None)
+    record["metadata"].pop("visual_dedup", None)
+    record["metadata"].pop("raw_labels", None)
+    record["metadata"].pop("representative_region_id", None)
+    record["metadata"]["source_image_id"] = source_image_id
+    record["metadata"]["image_metadata_ref"] = (
+        f"embedding_inputs/metadata.json#{source_image_id}"
+    )
+
+
+def _artifact_path(root: Path, relative: str, expected: str) -> Path:
+    if relative != expected:
+        raise ValueError(f"Resume artifact path mismatch: expected {expected}, got {relative}")
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"Resume artifact escapes knowledge base: {relative}") from exc
+    return path
+
+
+def _validate_artifact(path: Path, descriptor: dict[str, Any], label: str) -> None:
+    expected_hash = descriptor.get("sha256")
+    if not path.is_file() or not expected_hash:
+        raise ValueError(f"Resume {label} is missing or has no hash: {path}")
+    if sha256_file(path) != expected_hash:
+        raise ValueError(f"Resume {label} hash mismatch: {path}")
+
+
+def _load_resume_checkpoint(
+    temporary: Path,
+    image_metadata: dict[str, Any],
+    checkpoint: dict[str, Any],
+    text_records: list[dict[str, Any]],
+    image_records: list[dict[str, Any]],
+    embedder: Embedder,
+) -> tuple[Any, Any, int]:
+    import numpy as np
+
+    stored_checkpoint = image_metadata.get("checkpoint")
+    if stored_checkpoint is not None and stored_checkpoint != checkpoint:
+        raise ValueError("Resume checkpoint does not match sources, model, or preprocessing")
+    if image_metadata.get("image_preprocessing") != checkpoint["image_preprocessing"]:
+        raise ValueError("Resume image preprocessing does not match resolved config")
+
+    text_path = temporary / "vectors" / "text.npy"
+    image_path = temporary / "vectors" / "image.npy"
+    if not text_path.is_file() or not image_path.is_file():
+        raise ValueError("Resume vectors are incomplete")
+    text_matrix = np.load(text_path, allow_pickle=False)
+    image_matrix = np.load(image_path, allow_pickle=False)
+    expected_dtype = np.dtype(embedder.dtype)
+    if text_matrix.shape != (len(text_records), embedder.dimension):
+        raise ValueError(f"Resume text vector shape mismatch: {text_matrix.shape}")
+    if text_matrix.dtype != expected_dtype:
+        raise ValueError(f"Resume text vector dtype mismatch: {text_matrix.dtype}")
+    if image_matrix.ndim != 2 or image_matrix.shape[1] != embedder.dimension:
+        raise ValueError(f"Resume image vector shape mismatch: {image_matrix.shape}")
+    if image_matrix.dtype != expected_dtype:
+        raise ValueError(f"Resume image vector dtype mismatch: {image_matrix.dtype}")
+    for row, record in enumerate(text_records):
+        record["vector_ref"] = {"kind": "text_vector", "row": row}
+
+    items = image_metadata.get("items")
+    if not isinstance(items, list) or len(items) > len(image_records):
+        raise ValueError("Resume image metadata item count is invalid")
+    succeeded = 0
+    found_incomplete = False
+    for image_index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f"Resume image metadata item {image_index} is invalid")
+        record = image_records[image_index]
+        source = Path(record["_image_source"])
+        source_image_id = _source_image_id(record)
+        expected_regions, expected_dedup = _expected_image_metadata(record)
+        if item.get("source_image_id") != source_image_id:
+            raise ValueError(f"Resume image order mismatch at index {image_index}")
+        if item.get("source_regions", []) != expected_regions:
+            raise ValueError(f"Resume source regions mismatch for {source_image_id}")
+        if item.get("deduplication") != expected_dedup:
+            raise ValueError(f"Resume deduplication mismatch for {source_image_id}")
+        source_crop = item.get("source_crop") or {}
+        if source_crop.get("original_path") != str(source):
+            raise ValueError(f"Resume source crop mismatch for {source_image_id}")
+        crop_path = _artifact_path(
+            temporary, str(source_crop.get("path", "")), f"crops/{source_image_id}.png",
+        )
+        inputs = item.get("embedding_inputs")
+        if not isinstance(inputs, list) or len(inputs) != 1:
+            raise ValueError(f"Resume embedding inputs are invalid for {source_image_id}")
+        model_input = inputs[0]
+        input_path = _artifact_path(
+            temporary,
+            str(model_input.get("path", "")),
+            f"embedding_inputs/{source_image_id}-overview.png",
+        )
+        if model_input.get("embedding_index") != image_index:
+            raise ValueError(f"Resume embedding index mismatch for {source_image_id}")
+        status = model_input.get("status")
+        if status == "succeeded":
+            if found_incomplete:
+                raise ValueError("Resume successful image appears after an incomplete image")
+            _validate_artifact(crop_path, source_crop, "crop")
+            _validate_artifact(input_path, model_input, "embedding input")
+            if source.suffix.lower() == ".png" and sha256_file(source) != source_crop["sha256"]:
+                raise ValueError(f"Resume source image changed for {source_image_id}")
+            expected_ref = {"kind": "image_vector", "row": succeeded}
+            if model_input.get("vector_ref") != expected_ref:
+                raise ValueError(f"Resume vector row mismatch for {source_image_id}")
+            record["vector_ref"] = expected_ref
+            succeeded += 1
+        elif status in {"failed", "pending"}:
+            if found_incomplete or image_index != len(items) - 1:
+                raise ValueError("Resume contains multiple incomplete images")
+            found_incomplete = True
+            if crop_path.exists() or source_crop.get("sha256"):
+                _validate_artifact(crop_path, source_crop, "crop")
+                if source.suffix.lower() == ".png" and sha256_file(source) != source_crop["sha256"]:
+                    raise ValueError(f"Resume source image changed for {source_image_id}")
+            if input_path.exists() or model_input.get("sha256"):
+                _validate_artifact(input_path, model_input, "embedding input")
+        else:
+            raise ValueError(f"Resume image status is invalid for {source_image_id}: {status}")
+        _bind_image_record(record, source_image_id)
+
+    if image_matrix.shape[0] == succeeded + 1 and found_incomplete:
+        image_matrix = image_matrix[:succeeded]
+        _save_matrix(image_path, image_matrix)
+    elif image_matrix.shape[0] != succeeded:
+        raise ValueError(
+            f"Resume image vector count mismatch: {image_matrix.shape[0]} != {succeeded}"
+        )
+    image_metadata["checkpoint"] = checkpoint
+    image_metadata["schema_version"] = "1.1"
+    image_metadata["status"] = "building"
+    image_metadata.pop("failure", None)
+    return text_matrix, image_matrix, succeeded
+
+
 def build_knowledge_base(
     input_path: Path,
     output_dir: Path,
     config: dict[str, Any],
     embedder: Embedder,
+    *,
+    resume: bool = False,
 ) -> Path:
     try:
         import numpy as np
@@ -734,111 +951,140 @@ def build_knowledge_base(
     failed = output_dir / "knowledge_base.failed"
     if target.exists():
         raise FileExistsError(target)
-    if failed.exists():
-        raise FileExistsError(failed)
-    if temporary.exists():
-        shutil.rmtree(temporary)
-    (temporary / "vectors").mkdir(parents=True)
-    (temporary / "crops").mkdir()
-    (temporary / "embedding_inputs").mkdir()
-    image_metadata: dict[str, Any] = {
-        "schema_version": "1.0",
-        "status": "building",
-        "image_preprocessing": {
-            **image_preprocess,
-            "maintain_aspect_ratio": True,
-            "convert_rgb": True,
-            "exif_transpose": True,
-            "resample": "bicubic",
-        },
-        "items": [],
+    image_preprocessing = {
+        **image_preprocess,
+        "maintain_aspect_ratio": True,
+        "convert_rgb": True,
+        "exif_transpose": True,
+        "resample": "bicubic",
     }
+    checkpoint = _checkpoint_payload(
+        indexes, text_records, image_records, image_preprocessing, embedder,
+    )
+    if resume:
+        if failed.exists() and temporary.exists():
+            raise ValueError("Resume is ambiguous: both knowledge_base.failed and temporary exist")
+        resume_root = failed if failed.exists() else temporary
+        if not resume_root.exists():
+            raise FileNotFoundError(f"No failed knowledge base to resume under: {output_dir}")
+        resume_metadata_path = resume_root / "embedding_inputs" / "metadata.json"
+        if not resume_metadata_path.is_file():
+            raise ValueError("Resume image metadata is missing")
+        image_metadata = read_json(resume_metadata_path)
+        if not isinstance(image_metadata, dict):
+            raise ValueError("Resume image metadata must be a JSON object")
+        if resume_root == failed:
+            failed.replace(temporary)
+    else:
+        if failed.exists():
+            raise FileExistsError(failed)
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        (temporary / "vectors").mkdir(parents=True)
+        (temporary / "crops").mkdir()
+        (temporary / "embedding_inputs").mkdir()
+        image_metadata = {
+            "schema_version": "1.1",
+            "status": "building",
+            "image_preprocessing": image_preprocessing,
+            "checkpoint": checkpoint,
+            "items": [],
+        }
     metadata_path = temporary / "embedding_inputs" / "metadata.json"
     current_input: dict[str, Any] | None = None
     try:
-        text_matrix = (
-            _as_matrix(
-                embedder.encode_texts(text_values), len(text_values), embedder.dimension, "text",
+        if resume:
+            text_matrix, image_matrix, completed_images = _load_resume_checkpoint(
+                temporary, image_metadata, checkpoint, text_records, image_records, embedder,
             )
-            if text_values
-            else np.empty((0, embedder.dimension), dtype=vector_dtype)
-        )
-        text_matrix = _finalize_matrix(
-            text_matrix, embedder.dtype, embedder.normalize_embeddings, "text",
-        )
-        image_matrix = np.empty((0, embedder.dimension), dtype=vector_dtype)
-        for row, record in enumerate(text_records):
-            record["vector_ref"] = {"kind": "text_vector", "row": row}
-        np.save(temporary / "vectors" / "text.npy", text_matrix)
-        np.save(temporary / "vectors" / "image.npy", image_matrix)
-        write_json(metadata_path, image_metadata)
+            write_json(metadata_path, image_metadata)
+        else:
+            text_matrix = (
+                _as_matrix(
+                    embedder.encode_texts(text_values), len(text_values), embedder.dimension, "text",
+                )
+                if text_values
+                else np.empty((0, embedder.dimension), dtype=vector_dtype)
+            )
+            text_matrix = _finalize_matrix(
+                text_matrix, embedder.dtype, embedder.normalize_embeddings, "text",
+            )
+            image_matrix = np.empty((0, embedder.dimension), dtype=vector_dtype)
+            completed_images = 0
+            for row, record in enumerate(text_records):
+                record["vector_ref"] = {"kind": "text_vector", "row": row}
+            _save_matrix(temporary / "vectors" / "text.npy", text_matrix)
+            _save_matrix(temporary / "vectors" / "image.npy", image_matrix)
+            write_json(metadata_path, image_metadata)
 
         for image_index, record in enumerate(image_records):
             source = Path(record["_image_source"])
-            source_image_id = record["metadata"].get(
-                "representative_region_id", record["metadata"]["region_ids"][0],
-            )
-            if Path(source_image_id).name != source_image_id:
-                raise ValueError(f"Unsafe Surya region ID for image filename: {source_image_id}")
-
+            source_image_id = _source_image_id(record)
             crop_path = temporary / "crops" / f"{source_image_id}.png"
-            input_path = temporary / "embedding_inputs" / f"{source_image_id}-overview.png"
-            current_input = {
-                "kind": "overview",
-                "path": input_path.relative_to(temporary).as_posix(),
-                "width": None,
-                "height": None,
-                "pixel_count": None,
-                "mode": None,
-                "format": "PNG",
-                "sha256": None,
-                "embedding_index": image_index,
-                "model_input": None,
-                "vector_ref": None,
-                "status": "pending",
-                "error": None,
-            }
-            item = {
-                "source_image_id": source_image_id,
-                "source_crop": {
-                    "path": crop_path.relative_to(temporary).as_posix(),
-                    "original_path": str(source),
+            model_path = temporary / "embedding_inputs" / f"{source_image_id}-overview.png"
+            if image_index < len(image_metadata["items"]):
+                item = image_metadata["items"][image_index]
+                current_input = item["embedding_inputs"][0]
+                if image_index < completed_images:
+                    continue
+                current_input["status"] = "pending"
+                current_input["error"] = None
+                current_input["vector_ref"] = None
+            else:
+                source_regions, deduplication = _expected_image_metadata(record)
+                current_input = {
+                    "kind": "overview",
+                    "path": model_path.relative_to(temporary).as_posix(),
                     "width": None,
                     "height": None,
                     "pixel_count": None,
                     "mode": None,
-                    "format": None,
+                    "format": "PNG",
                     "sha256": None,
-                },
-                "source_regions": record["metadata"].pop("source_regions", []),
-                "deduplication": {
-                    "representative_selection": record["metadata"].pop(
-                        "representative_selection", None,
-                    ),
-                    "visual_dedup": record["metadata"].pop("visual_dedup", None),
-                    "raw_labels": record["metadata"].pop("raw_labels", []),
-                },
-                "embedding_inputs": [current_input],
-            }
-            image_metadata["items"].append(item)
-            record["metadata"].pop("representative_region_id", None)
-            record["metadata"]["source_image_id"] = source_image_id
-            record["metadata"]["image_metadata_ref"] = (
-                f"embedding_inputs/metadata.json#{source_image_id}"
-            )
+                    "embedding_index": image_index,
+                    "model_input": None,
+                    "vector_ref": None,
+                    "status": "pending",
+                    "error": None,
+                }
+                item = {
+                    "source_image_id": source_image_id,
+                    "source_crop": {
+                        "path": crop_path.relative_to(temporary).as_posix(),
+                        "original_path": str(source),
+                        "width": None,
+                        "height": None,
+                        "pixel_count": None,
+                        "mode": None,
+                        "format": None,
+                        "sha256": None,
+                    },
+                    "source_regions": source_regions,
+                    "deduplication": deduplication,
+                    "embedding_inputs": [current_input],
+                }
+                image_metadata["items"].append(item)
+            _bind_image_record(record, source_image_id)
             write_json(metadata_path, image_metadata)
 
             try:
-                _copy_crop_as_png(source, crop_path)
-                item["source_crop"].update(_image_details(crop_path))
-                item["source_crop"]["sha256"] = sha256_file(crop_path)
-                input_details = _materialize_embedding_input(
-                    source, input_path, image_preprocess,
-                )
-                current_input.update(input_details)
-                current_input["sha256"] = sha256_file(input_path)
+                if not crop_path.is_file() or not item["source_crop"].get("sha256"):
+                    _copy_crop_as_png(source, crop_path)
+                    item["source_crop"].update(_image_details(crop_path))
+                    item["source_crop"]["sha256"] = sha256_file(crop_path)
+                if not model_path.is_file() or not current_input.get("sha256"):
+                    input_details = _materialize_embedding_input(
+                        source, model_path, image_preprocess,
+                    )
+                    current_input.update(input_details)
+                    current_input["sha256"] = sha256_file(model_path)
+                else:
+                    input_details = {
+                        key: current_input[key]
+                        for key in ("width", "height", "pixel_count", "mode", "format")
+                    }
                 write_json(metadata_path, image_metadata)
-                model_input = embedder.inspect_image(input_path)
+                model_input = embedder.inspect_image(model_path)
                 expected_size = (input_details["width"], input_details["height"])
                 effective_size = (
                     int(model_input["effective_width"]),
@@ -850,8 +1096,10 @@ def build_knowledge_base(
                         f"Processor resized {source_image_id} from {expected_size} "
                         f"to {effective_size}"
                     )
+                encoded_image = embedder.encode_image(model_path)
+                embedder.synchronize()
                 row_matrix = _as_matrix(
-                    embedder.encode_image(input_path), 1, embedder.dimension, "image",
+                    encoded_image, 1, embedder.dimension, "image",
                 )
                 row_matrix = _finalize_matrix(
                     row_matrix, embedder.dtype, embedder.normalize_embeddings, "image",
@@ -861,7 +1109,7 @@ def build_knowledge_base(
                 record["vector_ref"] = {"kind": "image_vector", "row": vector_row}
                 current_input["vector_ref"] = record["vector_ref"]
                 current_input["status"] = "succeeded"
-                np.save(temporary / "vectors" / "image.npy", image_matrix)
+                _save_matrix(temporary / "vectors" / "image.npy", image_matrix)
                 write_json(metadata_path, image_metadata)
             except BaseException as exc:
                 current_input["status"] = "failed"

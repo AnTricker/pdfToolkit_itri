@@ -14,7 +14,7 @@ from .events import EventLogger
 from .extract import extract_document
 from .embedding import discover_surya_indexes
 from .sorting import natural_key
-from .io import write_json
+from .io import read_json, write_json
 from .metadata import utc_now, write_metadata
 from .png_to_pdf import convert_folder as convert_png_folder
 from .process import ProcessResult, run_process
@@ -231,6 +231,7 @@ def _marker_command(config: dict[str, Any], input_pdf: Path, result_root: Path) 
 
 def _embedding_command(
     config: dict[str, Any], input_path: Path, run_root: Path, config_json: Path,
+    *, resume: bool = False,
 ) -> tuple[list[str], list[str]]:
     replacements = {
         "input": str(input_path.resolve()),
@@ -238,6 +239,8 @@ def _embedding_command(
         "config_json": str(config_json.resolve()),
     }
     native = [str(part).format(**replacements) for part in config["embedding"]["command"]]
+    if resume:
+        native.append("--resume")
     command = [
         "conda", "run", "--no-capture-output", "-n",
         config["embedding"]["environment"], *native,
@@ -245,10 +248,35 @@ def _embedding_command(
     return command, native
 
 
-def run_qwen3vl(toolkit_root: Path, input_path: Path, custom_config: Path | None = None) -> Path:
-    input_path = input_path.expanduser().resolve()
-    indexes = discover_surya_indexes(input_path)
-    config = load_config(toolkit_root, custom_config)
+def _legacy_attempt(status: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "attempt": 0,
+        "kind": "initial",
+        "state": status.get("state", "unknown"),
+        "started_at": status.get("started_at"),
+        "finished_at": status.get("finished_at"),
+        "duration_seconds": status.get("duration_seconds"),
+        "exit_code": status.get("exit_code"),
+        "error": status.get("error"),
+    }
+
+
+def _next_resume_attempt(run_root: Path, status: dict[str, Any]) -> int:
+    recorded = [
+        int(item["attempt"])
+        for item in status.get("attempts", [])
+        if isinstance(item, dict) and isinstance(item.get("attempt"), int)
+    ]
+    logged = []
+    for path in run_root.glob("stdout.resume-*.log"):
+        try:
+            logged.append(int(path.stem.rsplit("-", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return max([0, *recorded, *logged]) + 1
+
+
+def _validated_embedding(config: dict[str, Any]) -> dict[str, Any]:
     embedding = config.get("embedding", {})
     if embedding.get("mode") != "qwen3vl":
         raise ValueError("embedding.mode must be qwen3vl")
@@ -258,27 +286,106 @@ def run_qwen3vl(toolkit_root: Path, input_path: Path, custom_config: Path | None
     settings = embedding.get("modes", {}).get("qwen3vl", {})
     if int(settings.get("dimension", 0)) <= 0:
         raise ValueError("qwen3vl dimension must be greater than zero")
+    return embedding
 
-    run_root = allocate_run_root(toolkit_root, config, "qwen3vl")
-    config_json = run_root / "resolved_config.json"
-    write_json(config_json, config)
-    command, native = _embedding_command(config, input_path, run_root, config_json)
+
+def run_qwen3vl(
+    toolkit_root: Path,
+    input_path: Path,
+    custom_config: Path | None = None,
+    resume_from: Path | None = None,
+) -> Path:
+    input_path = input_path.expanduser().resolve()
+    indexes = discover_surya_indexes(input_path)
+    if resume_from is not None and custom_config is not None:
+        raise ValueError("--config cannot be used with --resume-from")
+    if resume_from is None:
+        config = load_config(toolkit_root, custom_config)
+        embedding = _validated_embedding(config)
+        run_root = allocate_run_root(toolkit_root, config, "qwen3vl")
+        config_json = run_root / "resolved_config.json"
+        write_json(config_json, config)
+        status: dict[str, Any] = {
+            "mode": "qwen3vl", "state": "running", "input": str(input_path),
+            "source_index_count": len(indexes),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        attempt_number = 0
+        attempt = {
+            "attempt": 0, "kind": "initial", "state": "running",
+            "started_at": status["started_at"],
+        }
+        status["attempts"] = [attempt]
+        stdout_path = run_root / "stdout.log"
+        stderr_path = run_root / "stderr.log"
+    else:
+        run_root = resume_from.expanduser().resolve()
+        if not run_root.is_dir():
+            raise ValueError(f"Resume run folder does not exist: {run_root}")
+        if (run_root / "knowledge_base").exists():
+            raise ValueError(f"Completed knowledge base cannot be resumed: {run_root}")
+        resumable = [
+            path for path in (run_root / "knowledge_base.failed", run_root / ".knowledge_base.tmp")
+            if path.exists()
+        ]
+        if len(resumable) != 1:
+            raise ValueError(
+                "Resume requires exactly one knowledge_base.failed or .knowledge_base.tmp folder"
+            )
+        config_json = run_root / "resolved_config.json"
+        command_path = run_root / "command.json"
+        status_path = run_root / "status.json"
+        if not config_json.is_file() or not command_path.is_file() or not status_path.is_file():
+            raise ValueError("Resume run is missing resolved_config.json, command.json, or status.json")
+        config = read_json(config_json)
+        embedding = _validated_embedding(config)
+        prior_command = read_json(command_path)
+        expected_indexes = [str(path) for path in indexes]
+        if prior_command.get("input") != str(input_path):
+            raise ValueError("Resume Surya input does not match the original run")
+        if prior_command.get("source_indexes") != expected_indexes:
+            raise ValueError("Resume Surya index paths do not match the original run")
+        if prior_command.get("embedding") != config.get("embedding"):
+            raise ValueError("Resume embedding config does not match resolved_config.json")
+        if prior_command.get("embedding_preprocess") != config.get("embedding_preprocess", {}):
+            raise ValueError("Resume preprocessing config does not match resolved_config.json")
+        status = read_json(status_path)
+        if not isinstance(status.get("attempts"), list):
+            status["attempts"] = [_legacy_attempt(status)]
+        attempt_number = _next_resume_attempt(run_root, status)
+        attempt = {
+            "attempt": attempt_number, "kind": "resume", "state": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        status["attempts"].append(attempt)
+        status.update({
+            "state": "running", "error": None, "exit_code": None,
+            "finished_at": None,
+        })
+        stdout_path = run_root / f"stdout.resume-{attempt_number:02d}.log"
+        stderr_path = run_root / f"stderr.resume-{attempt_number:02d}.log"
+
+    command, native = _embedding_command(
+        config, input_path, run_root, config_json, resume=resume_from is not None,
+    )
     logger = EventLogger(run_root, config["logging"].get("redact_keys"))
-    write_json(run_root / "command.json", {
-        "command": command,
-        "native_command": native,
-        "input": str(input_path),
-        "source_indexes": [str(path) for path in indexes],
-        "embedding": embedding,
-        "embedding_preprocess": config.get("embedding_preprocess", {}),
-    })
-    environment = _environment_payload(config)
-    environment["embedding_environment"] = embedding["environment"]
-    write_json(run_root / "environment.json", environment)
-    status: dict[str, Any] = {
-        "mode": "qwen3vl", "state": "running", "input": str(input_path),
-        "source_index_count": len(indexes), "started_at": datetime.now(timezone.utc).isoformat(),
-    }
+    if resume_from is None:
+        write_json(run_root / "command.json", {
+            "command": command,
+            "native_command": native,
+            "input": str(input_path),
+            "source_indexes": [str(path) for path in indexes],
+            "embedding": embedding,
+            "embedding_preprocess": config.get("embedding_preprocess", {}),
+        })
+        environment = _environment_payload(config)
+        environment["embedding_environment"] = embedding["environment"]
+        write_json(run_root / "environment.json", environment)
+    else:
+        write_json(run_root / f"command.resume-{attempt_number:02d}.json", {
+            "command": command, "native_command": native, "input": str(input_path),
+            "source_indexes": [str(path) for path in indexes],
+        })
     write_json(run_root / "status.json", status)
     interval = float(config["metadata"]["sampling_interval_seconds"])
     started_at = utc_now()
@@ -287,7 +394,7 @@ def run_qwen3vl(toolkit_root: Path, input_path: Path, custom_config: Path | None
     warnings: list[str] = []
     try:
         process_result = run_process(
-            command, toolkit_root, run_root / "stdout.log", run_root / "stderr.log",
+            command, toolkit_root, stdout_path, stderr_path,
             logger, int(config["project"]["heartbeat_seconds"]), interval, mode="qwen3vl",
         )
         if process_result.exit_code != 0:
@@ -307,12 +414,25 @@ def run_qwen3vl(toolkit_root: Path, input_path: Path, custom_config: Path | None
             "duration_seconds": round(process_result.duration_seconds, 3),
             "finished_at": datetime.now(timezone.utc).isoformat(),
         })
+        attempt.update({
+            "state": "completed", "exit_code": process_result.exit_code,
+            "duration_seconds": round(process_result.duration_seconds, 3),
+            "finished_at": status["finished_at"],
+        })
         logger.emit("qwen3vl", "DONE", f"indexes={len(indexes)}")
         return run_root
     except Exception as exc:
         status.update({
             "state": "failed", "exit_code": process_result.exit_code if process_result else None,
             "error": str(exc), "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+        attempt.update({
+            "state": "failed",
+            "exit_code": process_result.exit_code if process_result else None,
+            "duration_seconds": round(
+                process_result.duration_seconds if process_result else time.monotonic() - started, 3,
+            ),
+            "error": str(exc), "finished_at": status["finished_at"],
         })
         logger.emit("qwen3vl", "FAILED", str(exc), level="ERROR")
         raise
@@ -321,8 +441,9 @@ def run_qwen3vl(toolkit_root: Path, input_path: Path, custom_config: Path | None
         samples = process_result.samples if process_result else []
         warnings.extend(process_result.warnings if process_result else ["Embedding process did not start; hardware samples are unavailable"])
         try:
+            metadata_root = run_root if resume_from is None else run_root / f"resume-{attempt_number:02d}"
             write_metadata(
-                run_root, command=command, image_count=len(indexes),
+                metadata_root, command=command, image_count=len(indexes),
                 started_at=process_result.started_at if process_result else started_at,
                 finished_at=process_result.finished_at if process_result else utc_now(), duration=duration,
                 exit_code=process_result.exit_code if process_result else None, samples=samples,

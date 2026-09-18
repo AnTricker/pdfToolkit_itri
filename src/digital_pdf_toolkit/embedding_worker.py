@@ -19,11 +19,13 @@ class SentenceTransformerEmbedder:
 
         runtime = settings["runtime"]
         self.model_id = str(settings["model_id"])
+        self._torch = torch
         self.revision = settings.get("revision")
         self.dimension = int(settings["dimension"])
         self.dtype = str(runtime.get("dtype", "float16"))
         self.normalize_embeddings = bool(runtime.get("normalize_embeddings", True))
         self.batch_size = int(runtime.get("batch_size", 1))
+        self.device = str(runtime.get("device", "cuda"))
         image_preprocess = preprocess.get("image_preprocess") or {}
         self.image_patch_size = int(image_preprocess.get("patch_size", 16))
         self.image_min_pixels = int(image_preprocess.get("min_pixels", 4096))
@@ -39,7 +41,7 @@ class SentenceTransformerEmbedder:
         self.model = SentenceTransformer(
             self.model_id,
             revision=self.revision,
-            device=str(runtime.get("device", "cuda")),
+            device=self.device,
             model_kwargs=model_kwargs,
             token=token,
         )
@@ -67,6 +69,10 @@ class SentenceTransformerEmbedder:
 
     def encode_image(self, value: Path) -> Any:
         return self._encode([{"image": str(value)}])
+
+    def synchronize(self) -> None:
+        if self.device.startswith("cuda"):
+            self._torch.cuda.synchronize()
 
     def _image_processor(self) -> Any:
         candidates = [self.model]
@@ -144,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("input", type=Path)
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--config-json", required=True, type=Path)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
     config = _load_config(args.config_json)
     embedding = config["embedding"]
@@ -156,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     embedder = SentenceTransformerEmbedder(
         settings, config.get("embedding_preprocess", {}),
     )
-    build_knowledge_base(args.input, args.output_dir, config, embedder)
+    build_knowledge_base(args.input, args.output_dir, config, embedder, resume=args.resume)
     return 0
 
 

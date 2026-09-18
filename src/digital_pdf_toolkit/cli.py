@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     qwen3vl = modes.add_parser("qwen3vl", help="Build an embedding knowledge base from Surya assets")
     qwen3vl.add_argument("input", type=Path)
     qwen3vl.add_argument("--config", type=Path)
+    qwen3vl.add_argument("--resume-from", type=Path)
     return parser
 
 
@@ -44,7 +45,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Output: {output}")
             return 0
         if args.command == "qwen3vl":
-            output = run_qwen3vl(toolkit_root(), args.input, args.config)
+            output = run_qwen3vl(
+                toolkit_root(), args.input, args.config, resume_from=args.resume_from,
+            )
             print(f"Output: {output}")
             return 0
         output, failed_batches = run_surya2(toolkit_root(), args.input, args.config)

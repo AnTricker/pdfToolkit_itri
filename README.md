@@ -153,6 +153,7 @@ Marker 預設固定使用 `balanced` mode，並透過 `llama.cpp` 的 `llama-ser
 ```bash
 ./scripts/linux/qwen3vl.sh output/MMDDHHmm_surya2
 ./scripts/linux/qwen3vl.sh output/MMDDHHmm_surya2/1/assets/index.json --config config/local.yml
+./scripts/linux/qwen3vl.sh output/MMDDHHmm_surya2 --resume-from output/MMDDHHmm_qwen3vl
 ```
 
 接受單一 Surya `assets/index.json`、單批 run 或數字 batch run。OCR 文字非空時只建立 `text_vector`；文字為空且 crop 可讀時才建立 `image_vector` 並複製 crop：
@@ -180,7 +181,7 @@ cp config/local.example.yml config/local.yml
 
 若只想覆寫單次執行，可另外建立 YAML 並使用 `--config path/to/override.yml`；其優先序高於 `config/local.yml`。
 
-圖片會逐張建立 checkpoint。若 image embedding 中途失敗，不會發布正式 knowledge base；已建立的 crop、實際模型輸入、metadata 與 vectors 會保留於同一 run 的 `knowledge_base.failed/` 供診斷，但後續執行不會自動復用。
+圖片會逐張建立 checkpoint。若 image embedding 中途失敗，不會發布正式 knowledge base；已建立的 crop、實際模型輸入、metadata 與 vectors 會保留於同一 run 的 `knowledge_base.failed/`。使用 `--resume-from` 可在原 run 內重用已成功 vectors，從失敗圖片接續；resume 強制沿用原本的 `resolved_config.json`，不可同時指定 `--config`。每次接續的 log 另存為 `stdout.resume-NN.log`／`stderr.resume-NN.log`，不覆寫先前紀錄。
 
 ## Output naming
 
