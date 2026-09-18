@@ -3,6 +3,8 @@
 embedding:
   modes:
     qwen3vl:
+      # Hugging Face model ID or an absolute local SentenceTransformer model directory.
+      # model_id: /absolute/path/to/Qwen3-VL-Embedding-8B
       runtime:
         device: cuda
         dtype: float16
